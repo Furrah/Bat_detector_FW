@@ -1,0 +1,108 @@
+# ==========================
+# STM32CubeIDE / Eclipse
+# ==========================
+
+.metadata/
+.recommenders/
+
+.settings/
+.project
+.cproject
+.classpath
+
+# CubeIDE build configurations
+Debug/
+Release/
+
+
+# ==========================
+# STM32Cube generated folders
+# ==========================
+
+Drivers/STM32G4xx_HAL_Driver/
+Middlewares/
+USB_DEVICE/
+
+
+# ==========================
+# Build outputs
+# ==========================
+
+*.o
+*.obj
+*.elf
+*.axf
+*.out
+*.hex
+*.bin
+*.map
+*.list
+
+# Linker generated files
+*.d
+*.su
+
+# ==========================
+# STM32CubeMX generated files
+# ==========================
+
+# Backup files
+*.bak
+*.tmp
+*.swp
+
+# CubeMX temporary files
+*.ioc~
+*.ioc.bak
+
+# ==========================
+# Debugging
+# ==========================
+
+*.launch
+*.log
+
+# OpenOCD / ST-Link
+*.stlink
+*.svd
+
+# ==========================
+# OS files
+# ==========================
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# macOS
+.DS_Store
+
+# Linux
+*~
+
+# ==========================
+# IDE temporary files
+# ==========================
+
+*.tmp
+*.temp
+
+# ==========================
+# VS Code (if used)
+# ==========================
+
+.vscode/
+
+# ==========================
+# Generated documentation
+# ==========================
+
+html/
+latex/
+
+# ==========================
+# Python / scripts
+# ==========================
+
+__pycache__/
+*.pyc

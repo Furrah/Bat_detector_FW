@@ -1,0 +1,34 @@
+/*
+ * dac.h
+ *
+ *  Created on: 5 Aug 2026
+ *      Author: Joe Spencer
+ */
+
+#ifndef DRIVERS_DAC_H_
+#define DRIVERS_DAC_H_
+
+#include <stdint.h>
+
+
+#define DAC_BUFFER_SIZE 256
+#define DAC_BLOCK_SIZE DAC_BUFFER_SIZE /2
+
+
+void DAC_Init(void);
+
+void DAC_Start(void);
+
+void DAC_Stop(void);
+
+
+/*
+ * Receive a block of processed samples
+ * from DSP.
+ */
+void DAC_WriteBlock(
+        const uint16_t *input,
+        uint32_t length);
+
+
+#endif /* DRIVERS_DAC_H_ */
