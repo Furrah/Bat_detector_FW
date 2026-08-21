@@ -29,6 +29,7 @@
 #include "dsp.h"
 #include "dac.h"
 #include "tim3_lo.h"
+#include "fft.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -136,12 +137,14 @@ int main(void)
   MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
 
-
+  // Enable Flush-to-Zero (FZ) mode on the Cortex-M4 FPU
+  // This prevents denormal numbers from causing CPU lag e.g. in the  biquad filter
+  __set_FPSCR(__get_FPSCR() | (1UL << 24));
 
   ADC_Init();
   DSP_Init();
   DAC_Init();
-
+  FFT_Init();
 
   ADC_SetHalfBufferCallback(DSP_ProcessBlock);
   ADC_SetFullBufferCallback(DSP_ProcessBlock);
@@ -179,9 +182,7 @@ int main(void)
 
 	        if(abs((int)adc - (int)lastADC) > 8)
 	        {
-	            uint32_t frequency =
-	                ((uint32_t)adc * 90000U)
-	                / 4095U;
+	            uint32_t frequency =((uint32_t)adc * 90000U) / 4095U;
 
 	            DSP_SetMixerFrequency((float)frequency);
 	            LO_SetFrequency(frequency);
@@ -206,11 +207,11 @@ int main(void)
 	            }
 
 
-
-
 	            lastADC = adc;
 	        }
 	    }
+
+	    FFT_Process();
 
 
     /* USER CODE END WHILE */

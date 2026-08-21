@@ -8,19 +8,22 @@
 
 #include "dsp.h"
 #include "dsp_filters.h"
-
+#include "fft.h"
 #include <math.h>
+
 
 static int16_t sineTable[LUT_SIZE];
 static uint32_t phase = 0;
 static uint32_t phaseIncrement;
 
-static volatile float loFrequency = 38000.0f;
+static float loFrequency = 38000.0f;
 
 static DSP_Callback_t outputCallback = 0;
 
 static Biquad_t lowPass1;
 static Biquad_t lowPass2;
+static Biquad_t high_pass;
+
 
 
 
@@ -33,14 +36,16 @@ void DSP_Init(void)
 
     DSP_SetMixerFrequency(38000.0f);
 
-
-    phaseIncrement =(uint32_t)((loFrequency *4294967296.0f)/SAMPLE_RATE);
+    phaseIncrement = DSP_calc_phase_increment(loFrequency,SAMPLE_RATE );
 
     /*20kHz Butterworth LPF*/
     Biquad_InitLowPass(&lowPass1,8000.0f,SAMPLE_RATE);
     Biquad_InitLowPass(&lowPass2,8000.0f,SAMPLE_RATE);
 
+    Biquad_InitHighPass(&high_pass, 10000.0f, SAMPLE_RATE);
+
     notch_filter_init();
+
 
 
 }
@@ -64,27 +69,24 @@ void DSP_ProcessBlock(
 
         int32_t sample = (int32_t)input[i] - 2048;
 
-//        sample = DCBlock_Process(sample); //
-//        sample = NotchFilter(sample); // 50 Hz notch
-//
+
+        sample =Biquad_Process(&high_pass,(float)sample);
         sample *= DSP_GAIN;
-//
+
         sample = DSP_Mixer(sample);
-//
+
         sample =Biquad_Process(&lowPass1,(float)sample);
         sample =Biquad_Process(&lowPass2,(float)sample);
-//
-//
-
 
         sample = DSP_clamp_output(sample);
 
-        output[i]=(uint16_t)sample;
+    	output[i]=(uint16_t)sample;
+
 
 
     }
 
-
+    FFT_AddSamples(input, length);
 
     if(outputCallback)
     {
@@ -123,15 +125,21 @@ void DSP_SetMixerFrequency(float frequency)
 
     loFrequency = frequency;
 
-    phaseIncrement =
-        (uint32_t)(
-            (frequency * 4294967296.0f)
-            / SAMPLE_RATE);
+    phaseIncrement = DSP_calc_phase_increment(frequency,SAMPLE_RATE );
+}
+
+uint32_t DSP_calc_phase_increment(float frequency, float sample_rate){
+
+	 const float TWO_POW_32 = 4294967296.0f;
+
+	 float increment = (frequency * TWO_POW_32) / sample_rate;
+
+	 return increment;
 }
 
 
 
-static int32_t DSP_Mixer(int32_t sample)
+int32_t DSP_Mixer(int32_t sample)
 {
     uint32_t index;
     int32_t oscillator;

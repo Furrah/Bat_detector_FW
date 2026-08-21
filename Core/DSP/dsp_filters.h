@@ -47,9 +47,16 @@ void Biquad_InitLowPass(
         float cutoff,
         float sampleRate);
 
+void Biquad_InitHighPass(
+        Biquad_t *filter,
+        float cutoff,
+        float sampleRate);
+
 float Biquad_Process(
         Biquad_t *filter,
         float input);
+
+
 
 
 #endif /* DSP_DSP_FILTERS_H_ */

@@ -46,9 +46,6 @@ void ADC_Start(void)
             &hadc1,
             (uint32_t*)adcBuffer,
             ADC_BUFFER_SIZE);
-
-
-
 }
 
 

@@ -11,7 +11,7 @@
 #include <stdint.h>
 
 
-#define DAC_BUFFER_SIZE 256
+#define DAC_BUFFER_SIZE 512
 #define DAC_BLOCK_SIZE DAC_BUFFER_SIZE /2
 
 

@@ -23,7 +23,7 @@ void HAL_DAC_ConvHalfCpltCallbackCh1(
 {
     if(dacBlockReady)
     {
-        for(uint32_t i=0;i<128;i++)
+        for(uint32_t i=0;i<DAC_BLOCK_SIZE;i++)
         {
             dacBuffer[i]=dacQueue[i];
         }
@@ -40,7 +40,7 @@ void HAL_DAC_ConvCpltCallbackCh1(
     {
         for(uint32_t i=0;i<DAC_BLOCK_SIZE;i++)
         {
-            dacBuffer[128+i]=dacQueue[i];
+            dacBuffer[DAC_BLOCK_SIZE+i]=dacQueue[i];
         }
 
         dacBlockReady=0;

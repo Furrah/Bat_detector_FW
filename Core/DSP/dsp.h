@@ -10,8 +10,8 @@
 
 #include <stdint.h>
 
-#define DSP_BLOCK_SIZE 128
-#define LUT_SIZE 256
+#define DSP_BLOCK_SIZE 256
+#define LUT_SIZE 512
 
 #define SAMPLE_RATE 192060.0f
 #define FILTER_CUTOFF 20000.0f
@@ -47,8 +47,13 @@ void DSP_ProcessBlock(
 void DSP_SetMixerFrequency(float frequency);
 
 
-static int32_t DSP_Mixer(int32_t sample);
+int32_t DSP_Mixer(int32_t sample);
+
 int32_t DSP_clamp_output(int32_t sample);
+
+uint32_t DSP_calc_phase_increment(float frequency, float sample_rate);
+
+void DSP_ProcessFFT(void);
 
 
 #endif /* DSP_DSP_H_ */

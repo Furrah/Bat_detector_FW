@@ -11,7 +11,7 @@
 #include <stdint.h>
 
 
-#define ADC_BUFFER_SIZE 256
+#define ADC_BUFFER_SIZE 512
 
 
 typedef void (*ADC_Callback_t)(

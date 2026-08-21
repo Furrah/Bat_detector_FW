@@ -123,6 +123,34 @@ void Biquad_InitLowPass(
 
 }
 
+void Biquad_InitHighPass(
+        Biquad_t *filter,
+        float cutoff,
+        float sampleRate)
+{
+    float K = tanf(M_PI * cutoff / sampleRate);
+
+    float norm =
+        1.0f /
+        (1.0f + sqrtf(2.0f) * K + K * K);
+
+    filter->b0 = 1.0f * norm;
+    filter->b1 = -2.0f * norm;
+    filter->b2 = 1.0f * norm;
+
+    filter->a1 =
+        2.0f * (K * K - 1.0f) * norm;
+
+    filter->a2 =
+        (1.0f - sqrtf(2.0f) * K + K * K) * norm;
+
+    /* Clear delay registers */
+    filter->x1 = 0.0f;
+    filter->x2 = 0.0f;
+    filter->y1 = 0.0f;
+    filter->y2 = 0.0f;
+}
+
 float Biquad_Process(
         Biquad_t *filter,
         float input)
