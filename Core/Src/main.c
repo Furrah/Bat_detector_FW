@@ -30,6 +30,12 @@
 #include "dac.h"
 #include "tim3_lo.h"
 #include "fft.h"
+#include "ili9341.h"
+#include "ili9341_touch.h"
+#include "fonts.h"
+
+#include "waterfall.h"
+
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -146,6 +152,18 @@ int main(void)
   DAC_Init();
   FFT_Init();
 
+
+  ILI9341_Unselect();
+  ILI9341_TouchUnselect();
+  ILI9341_Init();
+
+  HAL_GPIO_WritePin(DISPLAY_LED_GPIO_Port, DISPLAY_LED_Pin, GPIO_PIN_SET); // turn screen on
+  ILI9341_FillScreen(ILI9341_BLACK);
+
+  Waterfall_Init();
+  Waterfall_SetRange(-10.0f, 20.0f);
+
+
   ADC_SetHalfBufferCallback(DSP_ProcessBlock);
   ADC_SetFullBufferCallback(DSP_ProcessBlock);
 
@@ -168,8 +186,18 @@ int main(void)
 
   HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
 
+  uint32_t frequency = 0;
+
   static uint16_t lastADC = 0;
   static uint32_t lastRead = 0;
+  char text[32];
+
+  uint32_t last_flush_tick = HAL_GetTick();
+  uint32_t test_frame = 0;
+  static float test_mag[512];
+
+  Waterfall_SetLOFrequency(frequency);
+
 
   while (1)
   {
@@ -180,9 +208,9 @@ int main(void)
 
 	        uint16_t adc = ADC2_Read();
 
-	        if(abs((int)adc - (int)lastADC) > 8)
+	        if(abs((int)adc - (int)lastADC) > 16)
 	        {
-	            uint32_t frequency =((uint32_t)adc * 90000U) / 4095U;
+	            frequency =((uint32_t)adc * 90000U) / 4095U;
 
 	            DSP_SetMixerFrequency((float)frequency);
 	            LO_SetFrequency(frequency);
@@ -208,10 +236,26 @@ int main(void)
 
 
 	            lastADC = adc;
+
+	            snprintf(text, sizeof(text),"LO: %lu.%02lu kHz",frequency / 1000,(frequency % 1000) / 10);
+	            ILI9341_WriteString(5,5,text,Font_16x26,ILI9341_WHITE,ILI9341_BLACK);
 	        }
+
+
 	    }
 
 	    FFT_Process();
+
+	    if (fftMagnitudeReady) {
+	        fftMagnitudeReady = 0;
+	        Waterfall_Accumulate(fftMagnitude, FFT_NUM_BINS);
+	    }
+
+	    uint32_t now = HAL_GetTick();
+	    if ((now - last_flush_tick) >= 40) {
+	        Waterfall_FlushRow();
+	        last_flush_tick = now;
+	    }
 
 
     /* USER CODE END WHILE */
@@ -460,7 +504,7 @@ static void MX_SPI2_Init(void)
   hspi2.Instance = SPI2;
   hspi2.Init.Mode = SPI_MODE_MASTER;
   hspi2.Init.Direction = SPI_DIRECTION_2LINES;
-  hspi2.Init.DataSize = SPI_DATASIZE_4BIT;
+  hspi2.Init.DataSize = SPI_DATASIZE_8BIT;
   hspi2.Init.CLKPolarity = SPI_POLARITY_LOW;
   hspi2.Init.CLKPhase = SPI_PHASE_1EDGE;
   hspi2.Init.NSS = SPI_NSS_SOFT;

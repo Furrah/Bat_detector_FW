@@ -47,6 +47,17 @@ volatile uint8_t  fftMagnitudeReady = 0;
 volatile uint32_t fftDroppedBlocks  = 0;
 
 
+/* Hann window, one coefficient per real sample (0..FFT_LENGTH-1).
+ * Generated once at init into RAM rather than stored as a flash
+ * const table. */
+static float windowCoeff[FFT_LENGTH];
+
+
+
+
+
+
+
 static uint32_t BitReverse(uint32_t x, uint32_t bits)
 {
     uint32_t result = 0;
@@ -70,6 +81,19 @@ static void GenerateTwiddles(void)
         twiddleIm[k] = sinf(angle);
     }
 }
+
+
+
+static void GenerateWindow(void)
+{
+    // Hann window: w[n] = 0.5 * (1 - cos(2*pi*n / (N-1)))
+    for(uint32_t n = 0; n < FFT_LENGTH; n++)
+    {
+        windowCoeff[n] = 0.5f * (1.0f - cosf(2.0f * M_PI * (float)n / (float)(FFT_LENGTH - 1U)));
+    }
+}
+
+
 
 
 /*
@@ -132,6 +156,7 @@ static void CFFT_Radix2(float *re, float *im)
 void FFT_Init(void)
 {
     GenerateTwiddles();
+    GenerateWindow();
 
     fftFillIndex      = 0;
     fftBufferFull     = 0;
@@ -160,6 +185,14 @@ void FFT_AddSamples(const uint16_t *input, uint32_t length)
         // 12-bit ADC code (0..4095, midpoint ~2048) -> roughly +/-1.0f
         // could probably make this better by taking the average over the window. the real offset is around 2079
         float sample = ((float)input[i] - 2048.0f) * (1.0f / 2048.0f);
+
+
+        // Apply the Hann window before packing - must be indexed by the
+        // sample's true position in the 1024-sample block (fftFillIndex),
+        // not by n, since window taper is per-sample, not per complex pair.
+        sample *= windowCoeff[fftFillIndex];
+
+
 
         // Pack alternating samples into the complex pair z[n] = x[2n] + j*x[2n+1]
         uint32_t n = fftFillIndex >> 1U;
@@ -227,6 +260,11 @@ void FFT_Process(void)
             fftMagnitude[k] = sqrtf(Xre * Xre + Xim * Xim);
         }
     }
+
+
+    //TODO This is a big of a hack to remove the DC component from the waterfall plot..
+    fftMagnitude[0] = 0.0f;
+    fftMagnitude[1] = 0.0f;
 
     fftMagnitudeReady = 1;
 

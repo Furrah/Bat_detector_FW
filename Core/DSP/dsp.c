@@ -70,6 +70,7 @@ void DSP_ProcessBlock(
         int32_t sample = (int32_t)input[i] - 2048;
 
 
+
         sample =Biquad_Process(&high_pass,(float)sample);
         sample *= DSP_GAIN;
 
@@ -144,7 +145,7 @@ int32_t DSP_Mixer(int32_t sample)
     uint32_t index;
     int32_t oscillator;
 
-    index = phase >> 24;
+    index = phase >> 23;
 
     oscillator = sineTable[index];
 

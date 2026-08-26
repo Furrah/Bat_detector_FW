@@ -15,7 +15,7 @@
 
 #define SAMPLE_RATE 192060.0f
 #define FILTER_CUTOFF 20000.0f
-#define DSP_GAIN 12
+#define DSP_GAIN 8
 
 
 typedef void (*DSP_Callback_t)(const uint16_t *buffer, uint32_t length);
