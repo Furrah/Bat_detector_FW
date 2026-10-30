@@ -12,6 +12,8 @@
 
 #include <stdint.h>
 
+#include "pipeline_config.h"
+
 // Native portrait orientation matches ILI9341_ROTATION already in use
 // (MADCTL_MX | BGR) -- no MV bit, so hardware scroll behaves correctly.
 #define WF_SCREEN_W   240   // frequency axis (columns)
@@ -24,10 +26,11 @@
 #define WF_BFA        14
 #define WF_VSA        (WF_SCREEN_H - WF_TFA - WF_BFA)
 
-// Sample rate and FFT length must match fft.c/fft.h -- used to convert a
-// screen column back to a baseband frequency for the axis labels.
-#define WF_SAMPLE_RATE_HZ   192000UL
-#define WF_FFT_LENGTH       1024UL
+// Sample rate and FFT length come from pipeline_config.h, so they always
+// match fft.c -- used to convert a screen column back to a baseband
+// frequency for the axis labels.
+#define WF_SAMPLE_RATE_HZ   AUDIO_SAMPLE_RATE_HZ
+#define WF_FFT_LENGTH       AUDIO_FFT_LENGTH
 
 // Number of leading FFT bins to exclude from the plot: DC (bin 0) and its
 // local leakage into neighbouring bins. These dominate the magnitude scale

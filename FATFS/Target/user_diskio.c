@@ -35,6 +35,7 @@
 /* Includes ------------------------------------------------------------------*/
 #include <string.h>
 #include "ff_gen_drv.h"
+#include "sd_spi.h"
 
 /* Private typedef -----------------------------------------------------------*/
 /* Private define ------------------------------------------------------------*/
@@ -82,6 +83,12 @@ DSTATUS USER_initialize (
 {
   /* USER CODE BEGIN INIT */
     Stat = STA_NOINIT;
+
+    if(SD_Init() == SD_OK)
+    {
+        Stat &= (DSTATUS)~STA_NOINIT;
+    }
+
     return Stat;
   /* USER CODE END INIT */
 }
@@ -96,7 +103,7 @@ DSTATUS USER_status (
 )
 {
   /* USER CODE BEGIN STATUS */
-    Stat = STA_NOINIT;
+    /* set by USER_initialize; resetting it here would force a re-init on every access */
     return Stat;
   /* USER CODE END STATUS */
 }
@@ -117,7 +124,12 @@ DRESULT USER_read (
 )
 {
   /* USER CODE BEGIN READ */
-    return RES_OK;
+    if((Stat & STA_NOINIT) != 0U)
+    {
+        return RES_NOTRDY;
+    }
+
+    return (SD_ReadBlocks(buff, sector, count) == SD_OK) ? RES_OK : RES_ERROR;
   /* USER CODE END READ */
 }
 
@@ -138,8 +150,12 @@ DRESULT USER_write (
 )
 {
   /* USER CODE BEGIN WRITE */
-  /* USER CODE HERE */
-    return RES_OK;
+    if((Stat & STA_NOINIT) != 0U)
+    {
+        return RES_NOTRDY;
+    }
+
+    return (SD_WriteBlocks(buff, sector, count) == SD_OK) ? RES_OK : RES_ERROR;
   /* USER CODE END WRITE */
 }
 #endif /* _USE_WRITE == 1 */
@@ -160,6 +176,38 @@ DRESULT USER_ioctl (
 {
   /* USER CODE BEGIN IOCTL */
     DRESULT res = RES_ERROR;
+
+    if((Stat & STA_NOINIT) != 0U)
+    {
+        return RES_NOTRDY;
+    }
+
+    switch(cmd)
+    {
+    case CTRL_SYNC:
+        res = (SD_Sync() == SD_OK) ? RES_OK : RES_ERROR;
+        break;
+
+    case GET_SECTOR_COUNT:
+        *(DWORD *)buff = SD_GetSectorCount();
+        res = RES_OK;
+        break;
+
+    case GET_SECTOR_SIZE:
+        *(WORD *)buff = SD_SECTOR_SIZE;
+        res = RES_OK;
+        break;
+
+    case GET_BLOCK_SIZE:
+        *(DWORD *)buff = 1U;    /* erase block size not read: report 1 sector */
+        res = RES_OK;
+        break;
+
+    default:
+        res = RES_PARERR;
+        break;
+    }
+
     return res;
   /* USER CODE END IOCTL */
 }

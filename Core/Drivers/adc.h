@@ -10,8 +10,10 @@
 
 #include <stdint.h>
 
+#include "pipeline_config.h"
 
-#define ADC_BUFFER_SIZE 512
+
+#define ADC_BUFFER_SIZE AUDIO_BUFFER_SIZE
 
 
 typedef void (*ADC_Callback_t)(

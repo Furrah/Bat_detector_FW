@@ -26,10 +26,12 @@
 
 #include "math.h"
 
+#include "pipeline_config.h"
 #include "adc.h"
 #include "dsp.h"
 #include "dac.h"
 #include "psram.h"
+#include "sd_spi.h"
 #include "tim3_lo.h"
 #include "fft.h"
 #include "ili9341.h"
@@ -162,6 +164,12 @@ static void PSRAM_BootCheck(void)
     {
         ILI9341_WriteString(5, 90, "FAIL: bad ID", Font_11x18, ILI9341_RED, ILI9341_BLACK);
     }
+    else if(status == PSRAM_ERR_TIMEOUT)
+    {
+        // SPI1 SR decodes which flag never arrived (TXE bit 1, RXNE bit 0, BSY bit 7)
+        snprintf(text, sizeof(text), "SPI timeout SR=%04lX", PSRAM_GetTimeoutStatus());
+        ILI9341_WriteString(5, 90, text, Font_11x18, ILI9341_RED, ILI9341_BLACK);
+    }
     else
     {
         snprintf(text, sizeof(text), "FAIL at 0x%06lX", failAddress);
@@ -175,6 +183,171 @@ static void PSRAM_BootCheck(void)
             (selectNs > PSRAM_TCEM_NS) ? ILI9341_RED : ILI9341_WHITE, ILI9341_BLACK);
 
     HAL_Delay((status == PSRAM_OK) ? 1500U : 5000U);
+}
+
+
+#define SD_TEST_FILE_BYTES  (256UL * 1024UL)
+
+static uint8_t SD_TestPattern(uint32_t offset)
+{
+    return (uint8_t)(offset ^ (offset >> 8) ^ (offset >> 16));
+}
+
+
+/*
+ * Write, read back and verify a 256 KB file and show the speeds. Uses
+ * 64-byte f_write/f_read calls: FatFS gathers them in its 512-byte sector
+ * buffer, so the card only sees single-sector writes. Recording will use
+ * multi-sector writes once RAM is reclaimed, so this figure is pessimistic.
+ */
+static void SD_SpeedTest(void)
+{
+    char text[24];
+    uint8_t buffer[64];
+    UINT done;
+    FRESULT result;
+    FRESULT closeResult;
+    uint32_t start;
+    uint32_t writeMs = 1U;
+    uint32_t readMs = 1U;
+    uint32_t badOffset = 0xFFFFFFFFU;
+
+    ILI9341_WriteString(5, 175, "SD speed test...", Font_11x18, ILI9341_WHITE, ILI9341_BLACK);
+
+    result = f_open(&USERFile, "SDTEST.BIN", FA_CREATE_ALWAYS | FA_WRITE);
+
+    if(result == FR_OK)
+    {
+        start = HAL_GetTick();
+
+        for(uint32_t offset = 0U; (offset < SD_TEST_FILE_BYTES) && (result == FR_OK); offset += sizeof(buffer))
+        {
+            for(uint32_t i = 0U; i < sizeof(buffer); i++)
+            {
+                buffer[i] = SD_TestPattern(offset + i);
+            }
+
+            result = f_write(&USERFile, buffer, sizeof(buffer), &done);
+
+            if((result == FR_OK) && (done != sizeof(buffer)))
+            {
+                result = FR_DENIED;     // card full
+            }
+        }
+
+        // closing flushes the last sector, so it counts towards the write time
+        closeResult = f_close(&USERFile);
+        writeMs = HAL_GetTick() - start + 1U;
+
+        if(result == FR_OK)
+        {
+            result = closeResult;
+        }
+    }
+
+    if(result == FR_OK)
+    {
+        result = f_open(&USERFile, "SDTEST.BIN", FA_READ);
+    }
+
+    if(result == FR_OK)
+    {
+        start = HAL_GetTick();
+
+        for(uint32_t offset = 0U; (offset < SD_TEST_FILE_BYTES) && (result == FR_OK)
+                && (badOffset == 0xFFFFFFFFU); offset += sizeof(buffer))
+        {
+            result = f_read(&USERFile, buffer, sizeof(buffer), &done);
+
+            if((result == FR_OK) && (done != sizeof(buffer)))
+            {
+                result = FR_INT_ERR;    // file shorter than written
+            }
+
+            for(uint32_t i = 0U; (i < sizeof(buffer)) && (result == FR_OK); i++)
+            {
+                if((buffer[i] != SD_TestPattern(offset + i)) && (badOffset == 0xFFFFFFFFU))
+                {
+                    badOffset = offset + i;
+                }
+            }
+        }
+
+        readMs = HAL_GetTick() - start + 1U;
+        (void)f_close(&USERFile);
+    }
+
+    if(result != FR_OK)
+    {
+        snprintf(text, sizeof(text), "SD test err %d", (int)result);
+        ILI9341_WriteString(5, 175, text, Font_11x18, ILI9341_RED, ILI9341_BLACK);
+    }
+    else if(badOffset != 0xFFFFFFFFU)
+    {
+        snprintf(text, sizeof(text), "SD bad at 0x%05lX", badOffset);
+        ILI9341_WriteString(5, 175, text, Font_11x18, ILI9341_RED, ILI9341_BLACK);
+    }
+    else
+    {
+        // kB/s = 256 KB / seconds
+        snprintf(text, sizeof(text), "W%lu R%lu kB/s",
+                (SD_TEST_FILE_BYTES / 1024UL) * 1000UL / writeMs,
+                (SD_TEST_FILE_BYTES / 1024UL) * 1000UL / readMs);
+        ILI9341_WriteString(5, 175, text, Font_11x18, ILI9341_GREEN, ILI9341_BLACK);
+    }
+}
+
+
+/*
+ * SD card check, run once at boot after the PSRAM check. Mounts the card
+ * and shows its type and size. Hold PLAYBACK at power-up to also run the
+ * 256 KB write/read speed test.
+ */
+static void SD_BootCheck(void)
+{
+    char text[24];
+    FRESULT result;
+    uint8_t speedTest = (HAL_GPIO_ReadPin(PLAYBACK_BUTTON_GPIO_Port, PLAYBACK_BUTTON_Pin) == GPIO_PIN_RESET);
+
+    // 1 = mount now, so a missing card shows up here rather than on first use
+    result = f_mount(&USERFatFs, USERPath, 1);
+
+    if(result == FR_NOT_READY)
+    {
+        if(SD_GetInitStatus() == SD_ERR_NO_CARD)
+        {
+            ILI9341_WriteString(5, 150, "SD: no card", Font_11x18, ILI9341_RED, ILI9341_BLACK);
+        }
+        else
+        {
+            snprintf(text, sizeof(text), "SD: init fail %d", (int)SD_GetInitStatus());
+            ILI9341_WriteString(5, 150, text, Font_11x18, ILI9341_RED, ILI9341_BLACK);
+        }
+    }
+    else if(result == FR_NO_FILESYSTEM)
+    {
+        // exFAT cards (64 GB+) land here: FatFS is built without exFAT
+        ILI9341_WriteString(5, 150, "SD: not FAT32", Font_11x18, ILI9341_RED, ILI9341_BLACK);
+    }
+    else if(result != FR_OK)
+    {
+        snprintf(text, sizeof(text), "SD: mount err %d", (int)result);
+        ILI9341_WriteString(5, 150, text, Font_11x18, ILI9341_RED, ILI9341_BLACK);
+    }
+    else
+    {
+        snprintf(text, sizeof(text), "SD %s %luMB",
+                (SD_GetCardType() == SD_CARD_V2_HC) ? "SDHC" : "SDSC",
+                SD_GetSectorCount() / 2048UL);
+        ILI9341_WriteString(5, 150, text, Font_11x18, ILI9341_GREEN, ILI9341_BLACK);
+
+        if(speedTest)
+        {
+            SD_SpeedTest();
+        }
+    }
+
+    HAL_Delay(1500U);
 }
 
 /* USER CODE END 0 */
@@ -247,6 +420,9 @@ int main(void)
   // the result off the screen afterwards.
   PSRAM_BootCheck();
 
+  // Hold PLAYBACK at power-up for the SD write/read speed test
+  SD_BootCheck();
+
   Waterfall_Init();
   Waterfall_SetRange(-10.0f, 20.0f);
 
@@ -314,7 +490,7 @@ int main(void)
 
 	        if(abs((int)adc - (int)lastADC) > 16)
 	        {
-	            frequency =((uint32_t)adc * 90000U) / 4095U;
+	            frequency =((uint32_t)adc * AUDIO_LO_MAX_HZ) / 4095U;
 
 	            DSP_SetMixerFrequency((float)frequency);
 	            LO_SetFrequency(frequency);
@@ -338,7 +514,8 @@ int main(void)
 
 	            lastADC = adc;
 
-	            snprintf(text, sizeof(text),"LO: %lu.%02lu kHz",frequency / 1000,(frequency % 1000) / 10);
+	            // fixed 13-char width: ends at x=213, clear of the battery readout
+	            snprintf(text, sizeof(text),"LO: %3lu.%lu kHz",frequency / 1000,(frequency % 1000) / 100);
 	            ILI9341_WriteString(5,5,text,Font_16x26,ILI9341_WHITE,ILI9341_BLACK);
 	        }
 
@@ -805,6 +982,13 @@ static void MX_TIM2_Init(void)
     Error_Handler();
   }
   /* USER CODE BEGIN TIM2_Init 2 */
+
+  // pipeline_config.h is the authoritative sample rate: catch a CubeMX
+  // TIM2 period that no longer matches it
+  if (htim2.Init.Period != (AUDIO_TIMER_PERIOD - 1U))
+  {
+    Error_Handler();
+  }
 
   /* USER CODE END TIM2_Init 2 */
 

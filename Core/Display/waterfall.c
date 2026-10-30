@@ -135,9 +135,10 @@ static void DrawLOLabel(void) {
     ILI9341_FillRectangle(0, 0, WF_SCREEN_W, WF_TFA, ILI9341_BLACK);
 
     char text[24];
-    snprintf(text, sizeof(text), "LO: %lu.%02lu kHz",
+    // same fixed 13-char format as main.c, clear of the battery readout
+    snprintf(text, sizeof(text), "LO: %3lu.%lu kHz",
              (unsigned long)(s_lo_freq_hz / 1000),
-             (unsigned long)((s_lo_freq_hz % 1000) / 10));
+             (unsigned long)((s_lo_freq_hz % 1000) / 100));
 
     ILI9341_WriteString(5, 5, text, Font_16x26, ILI9341_WHITE, ILI9341_BLACK);
 }

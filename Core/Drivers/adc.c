@@ -28,9 +28,50 @@ static uint16_t adc2Buffer[ADC2_NUM_CHANNELS];
 static volatile uint8_t adc2ScanReady = 0;
 
 
+/*
+ * Worst-case time spent in the block callback (DSP_ProcessBlock), in CPU
+ * cycles and as a % of one block period. Watch these in Live Expressions:
+ * at 100% the DMA overwrites the half being processed, and well before
+ * that the main loop (FFT, display) starves.
+ */
+volatile uint32_t dspCyclesMax = 0;
+volatile uint32_t dspLoadMaxPercent = 0;
+
+static uint32_t blockCycles = 1;
+
+
+
+/*
+ * Run one block callback and record how long it took, using the DWT
+ * cycle counter.
+ */
+static void ADC_RunBlockCallback(ADC_Callback_t callback, uint16_t *block)
+{
+    uint32_t start = DWT->CYCCNT;
+    uint32_t cycles;
+
+    callback(block, AUDIO_BLOCK_SIZE);
+
+    cycles = DWT->CYCCNT - start;
+
+    if(cycles > dspCyclesMax)
+    {
+        dspCyclesMax = cycles;
+        dspLoadMaxPercent = (cycles * 100U) / blockCycles;
+    }
+}
+
+
 
 void ADC_Init(void)
 {
+    /* DWT cycle counter for the DSP load measurement */
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+
+    /* CPU cycles in one block period: 680 x 256 = 174 080 at 250 kHz */
+    blockCycles = (SystemCoreClock / AUDIO_SAMPLE_RATE_HZ) * AUDIO_BLOCK_SIZE;
+
     HAL_ADCEx_Calibration_Start(
             &hadc1,
             ADC_SINGLE_ENDED);
@@ -83,10 +124,7 @@ void HAL_ADC_ConvHalfCpltCallback(
 
         if(halfCallback != 0)
         {
-
-        	halfCallback(
-        	    &adcBuffer[0],
-        	    ADC_BUFFER_SIZE/2);
+            ADC_RunBlockCallback(halfCallback, &adcBuffer[0]);
         }
     }
 }
@@ -103,9 +141,7 @@ void HAL_ADC_ConvCpltCallback(
 
         if(fullCallback != 0)
         {
-        	fullCallback(
-        	    &adcBuffer[ADC_BUFFER_SIZE/2],
-        	    ADC_BUFFER_SIZE/2);
+            ADC_RunBlockCallback(fullCallback, &adcBuffer[AUDIO_BLOCK_SIZE]);
         }
     }
     else if(hadc == &hadc2)

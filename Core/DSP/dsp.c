@@ -127,8 +127,8 @@ void DSP_SetMixerFrequency(float frequency)
     if(frequency < 0.0f)
         frequency = 0.0f;
 
-    if(frequency > 90000.0f)
-        frequency = 90000.0f;
+    if(frequency > (float)AUDIO_LO_MAX_HZ)
+        frequency = (float)AUDIO_LO_MAX_HZ;
 
     loFrequency = frequency;
 

@@ -15,10 +15,11 @@
 
 /*
  * Max data bytes per CE# cycle. CE# may stay low for at most tCEM (8 us).
- * In the -O0 Debug build the polled byte loop takes ~80 cycles/byte
- * (~0.47 us: 32 on the wire, the rest stack loads/stores), so 8 data bytes
- * + a 5-byte read header is ~6.2 us, while 16 would be ~10 us. Must divide
- * the 1 KB page size. Check PSRAM_GetMaxSelectNs() after changing.
+ * The polled byte loop is CPU-bound: an 8-byte read (+ 5-byte header)
+ * measured 4.1 us CE# low at -Og and 5.8 us at -O0. 16 bytes would fit at
+ * -Og (~6.7 us) but not at -O0 (~10 us), so 8 is safe in either build.
+ * Must divide the 1 KB page size. Check PSRAM_GetMaxSelectNs() after
+ * changing.
  */
 #define PSRAM_MAX_BURST     8U
 
@@ -29,7 +30,8 @@ typedef enum
 {
     PSRAM_OK = 0,
     PSRAM_ERR_ID,       /* Read ID did not return MF 0x0D / KGD 0x5D */
-    PSRAM_ERR_DATA      /* a test read back the wrong value */
+    PSRAM_ERR_DATA,     /* a test read back the wrong value */
+    PSRAM_ERR_TIMEOUT   /* an SPI flag never set; see PSRAM_GetTimeoutStatus() */
 } PSRAM_Status_t;
 
 
@@ -40,12 +42,12 @@ typedef enum
 PSRAM_Status_t PSRAM_Init(void);
 void PSRAM_GetId(uint8_t *mfid, uint8_t *kgd);
 
-void PSRAM_Write(uint32_t address, const uint8_t *data, uint32_t length);
-void PSRAM_Read(uint32_t address, uint8_t *data, uint32_t length);
+PSRAM_Status_t PSRAM_Write(uint32_t address, const uint8_t *data, uint32_t length);
+PSRAM_Status_t PSRAM_Read(uint32_t address, uint8_t *data, uint32_t length);
 
 /*
- * Destructive tests. On PSRAM_ERR_DATA, failAddress holds the first bad
- * address (for the address-line test: the address line under test).
+ * Destructive tests. On failure, failAddress holds the first bad address
+ * (for the address-line test: the address line under test).
  */
 PSRAM_Status_t PSRAM_TestAddressLines(uint32_t *failAddress);
 PSRAM_Status_t PSRAM_TestFull(uint32_t *failAddress);
@@ -55,6 +57,9 @@ PSRAM_Status_t PSRAM_TestFull(uint32_t *failAddress);
  * PSRAM_TCEM_NS or the PSRAM can't refresh while selected.
  */
 uint32_t PSRAM_GetMaxSelectNs(void);
+
+/* SPI1 SR captured when the last PSRAM_ERR_TIMEOUT happened */
+uint32_t PSRAM_GetTimeoutStatus(void);
 
 
 #endif /* DRIVERS_PSRAM_H_ */

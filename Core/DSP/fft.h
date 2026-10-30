@@ -10,7 +10,9 @@
 
 #include <stdint.h>
 
-#define FFT_LENGTH    1024U                    // real samples per capture
+#include "pipeline_config.h"
+
+#define FFT_LENGTH    AUDIO_FFT_LENGTH         // real samples per capture
 #define FFT_NUM_BINS  (FFT_LENGTH / 2U + 1U)    // DC ... Nyquist inclusive (513)
 
 void FFT_Init(void);

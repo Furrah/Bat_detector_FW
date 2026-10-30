@@ -10,10 +10,12 @@
 
 #include <stdint.h>
 
-#define DSP_BLOCK_SIZE 256
+#include "pipeline_config.h"
+
+#define DSP_BLOCK_SIZE AUDIO_BLOCK_SIZE
 #define LUT_SIZE 512
 
-#define SAMPLE_RATE 192060.0f
+#define SAMPLE_RATE ((float)AUDIO_SAMPLE_RATE_HZ)
 #define FILTER_CUTOFF 20000.0f
 #define DSP_GAIN 8
 

@@ -10,9 +10,11 @@
 
 #include <stdint.h>
 
+#include "pipeline_config.h"
 
-#define DAC_BUFFER_SIZE 512
-#define DAC_BLOCK_SIZE DAC_BUFFER_SIZE /2
+
+#define DAC_BUFFER_SIZE AUDIO_BUFFER_SIZE
+#define DAC_BLOCK_SIZE AUDIO_BLOCK_SIZE
 
 
 void DAC_Init(void);
