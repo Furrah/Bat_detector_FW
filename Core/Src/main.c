@@ -30,6 +30,7 @@
 #include "adc.h"
 #include "dsp.h"
 #include "bat_detect.h"
+#include "playback.h"
 #include "debug_link.h"
 #include "dac.h"
 #include "psram.h"
@@ -64,6 +65,12 @@
 
 // LED1 flash per detected bat pulse; long enough to see (calls are 1-30 ms)
 #define PULSE_LED_MS       50U
+
+// PLAYBACK button: must read the same for 3 x 10 ms ticks to count
+#define PLAYBACK_DEBOUNCE_TICKS  3U
+
+// How long "PLAY: no ring" / "PLAY: busy" stays up before the LO readout returns
+#define PLAYBACK_MESSAGE_MS      2000U
 
 /* USER CODE END PD */
 
@@ -108,6 +115,7 @@ static void MX_TIM2_Init(void);
 static void MX_SPI1_Init(void);
 static void MX_RTC_Init(void);
 /* USER CODE BEGIN PFP */
+static void ShowLoLabel(uint32_t frequency);
 
 /* USER CODE END PFP */
 
@@ -495,6 +503,13 @@ int main(void)
   uint32_t lastPulseCount = 0;
   uint32_t pulseLedOffTick = 0;
 
+  // Starts as "held", so a press left over from the power-up SD test has
+  // to be released before it counts
+  uint8_t playbackButton = 1;
+  uint8_t playbackDebounce = 0;
+  uint32_t playbackLabel = 0;           // seconds shown in the playback label; 0 = LO label shown
+  uint32_t playbackMessageUntil = 0;
+
   Waterfall_SetLOFrequency(frequency);
 
 
@@ -530,9 +545,62 @@ int main(void)
 
 	            lastADC = adc;
 
-	            // fixed 13-char width: ends at x=213, clear of the battery readout
-	            snprintf(text, sizeof(text),"LO: %3lu.%lu kHz",frequency / 1000,(frequency % 1000) / 100);
-	            ILI9341_WriteString(5,5,text,Font_16x26,ILI9341_WHITE,ILI9341_BLACK);
+	            // the playback label has the spot while it's up
+	            if(playbackLabel == 0)
+	            {
+	                ShowLoLabel(frequency);
+	            }
+	        }
+
+	        // PLAYBACK: replay the last 2 s ten times slower; press again to stop
+	        uint8_t playbackDown = (HAL_GPIO_ReadPin(PLAYBACK_BUTTON_GPIO_Port, PLAYBACK_BUTTON_Pin) == GPIO_PIN_RESET);
+
+	        if(playbackDown == playbackButton)
+	        {
+	            playbackDebounce = 0;
+	        }
+	        else if(++playbackDebounce >= PLAYBACK_DEBOUNCE_TICKS)
+	        {
+	            playbackButton = playbackDown;
+	            playbackDebounce = 0;
+
+	            if(playbackButton && Playback_IsActive())
+	            {
+	                Playback_Stop();
+	            }
+	            else if(playbackButton)
+	            {
+	                Playback_Status_t status = Playback_Start();
+
+	                playbackLabel = UINT32_MAX;         // redraw now
+	                playbackMessageUntil = lastRead;
+
+	                if(status != PLAYBACK_OK)
+	                {
+	                    ILI9341_WriteString(5, 5, (status == PLAYBACK_ERR_BUSY) ? "PLAY: busy   " : "PLAY: no ring",
+	                            Font_16x26, ILI9341_WHITE, ILI9341_BLACK);
+	                    playbackMessageUntil = lastRead + PLAYBACK_MESSAGE_MS;
+	                }
+	            }
+	        }
+
+	        // Playback label: "PLAY 10x  20s", counting down. Put the LO
+	        // readout back once playback (or an error message) is over.
+	        if(Playback_IsActive())
+	        {
+	            uint32_t seconds = (Playback_GetRemainingMs() + 999U) / 1000U;
+
+	            if(seconds != playbackLabel)
+	            {
+	                playbackLabel = seconds;
+	                snprintf(text, sizeof(text), "PLAY %lux %3lus", (unsigned long)PLAYBACK_EXPANSION, seconds);
+	                ILI9341_WriteString(5, 5, text, Font_16x26, ILI9341_WHITE, ILI9341_BLACK);
+	            }
+	        }
+	        else if((playbackLabel != 0) && ((int32_t)(lastRead - playbackMessageUntil) >= 0))
+	        {
+	            playbackLabel = 0;
+	            ShowLoLabel(frequency);
 	        }
 
 	        // Bat detector, stage 1 (monitor only, the amp stays on):
@@ -1186,6 +1254,16 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+
+// LO readout at the top left. Fixed 13-char width: ends at x=213, clear of
+// the battery readout. The playback label uses the same spot.
+static void ShowLoLabel(uint32_t frequency)
+{
+    char text[32];
+
+    snprintf(text, sizeof(text), "LO: %3lu.%lu kHz", frequency / 1000, (frequency % 1000) / 100);
+    ILI9341_WriteString(5, 5, text, Font_16x26, ILI9341_WHITE, ILI9341_BLACK);
+}
 
 /* USER CODE END 4 */
 

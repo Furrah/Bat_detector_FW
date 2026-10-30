@@ -236,7 +236,7 @@ void DebugLink_AddBlock(const uint16_t *input, uint32_t length, float energy)
 
             /* the ring took this block just before the DSP ran */
             snapshotRingBlock = PsramRing_GetPushedBlocks() - 1U;
-            snapshotInRing = PsramRing_IsRunning();
+            snapshotInRing = PsramRing_IsRecording();     /* not while playback has it paused */
         }
 
         memcpy(&captureBuffer.samples[filled * AUDIO_BLOCK_SIZE], input,

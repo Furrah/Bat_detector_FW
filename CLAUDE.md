@@ -16,8 +16,8 @@ Handheld, battery-powered ultrasonic bat detector covering the 20–120 kHz echo
 
 - CubeMX-generated files: only edit inside `/* USER CODE BEGIN */ … /* USER CODE END */` blocks. Anything outside is wiped when the .ioc is regenerated.
 - Make incremental, targeted changes scoped to the function or module in question, with the rationale stated. No whole-file rewrites.
-- RAM: 2.9 KB free with the USB debug capture and the PSRAM ring built in (29.9 KB used, including a 2 KB stack, a 0.5 KB heap reservation and 1 KB of PSRAM-ring interrupt code that runs from RAM). `DEBUG_CAPTURE 0` in `debug_link.h` frees its 8 KB buffer. No malloc, no large stack buffers.
-- Flash: 81.9 KB of 128 KB used at `-Og` (95 KB at `-O0` before the capture module). Large constant tables belong in flash rather than RAM.
+- RAM: 1.7 KB free with the USB debug capture, the PSRAM ring and playback built in (31.0 KB used, including a 2 KB stack, a 0.5 KB heap reservation, 1 KB of PSRAM-ring interrupt code that runs from RAM, and playback's 1 KB of block buffers). `DEBUG_CAPTURE 0` in `debug_link.h` frees its 8 KB buffer. No malloc, no large stack buffers.
+- Flash: 83.3 KB of 128 KB used at `-Og` (95 KB at `-O0` before the capture module). Large constant tables belong in flash rather than RAM.
 - Interrupt priorities: DMA2 Channel 1 (the PSRAM ring's burst interrupt) must be the only interrupt at priority 0; everything else at 1 or lower. `PsramRing_Start()` refuses to run otherwise (boot screen: "Ring: NVIC prio"). Diary entry 34.
   - `__disable_irq()` blocks priority 0 too. Keep masked sections in code that runs while the ring is busy to a few dozen instructions: a masked section that delays a burst's end stretches CE#. Bursts have ~3.5 µs of slack (entry 36).
 - Lookup tables are generated into `Core/DSP/Tables/` by `python Tools/gen_dsp_tables.py`: the Hann window, FFT twiddles, FFT unpack rotation and NCO sine. Don't edit them by hand. Rerun the script after changing `AUDIO_FFT_LENGTH` or `LUT_SIZE`; a static assert fails the build if a table is stale. Python 3 is installed.
@@ -100,7 +100,12 @@ Unused: PA7, PA10, PA15, PB1, PB9, PC13.
   - `PsramRing_PushBlock` is called from the ADC callbacks in `adc.c`. `PsramRing_ReadBlock` queues a read by block number, and writes go before reads.
   - Live Expressions: `psramRingMaxSelectNs` (must stay below 8000), `psramRingOverTcem`, `psramRingLateBlocks` and `psramRingFaults` (must stay 0), `psramRingBlocks`, `psramRingReads`.
   - Timing diagnostics: `psramRingMinSelectNs`, `psramRingMaxEntryNs` (CE# low to interrupt start), `psramRingMaxIsrNs` (CPU per burst), `psramRingBursts`. Write 1 to `psramRingResetStats` to restart them.
-  - Verify with `python -I Tools/capture.py verify --count 50`: debug link `M` reads the last snapshot back from the ring and the PC compares it bit for bit.
+  - Verify with `python -I Tools/capture.py verify --count 50`: debug link `M` reads the last snapshot back from the ring and the PC compares it bit for bit. It fails while playback has the ring paused.
+  - `PsramRing_SetPaused()` stops recording (reads still run); `PsramRing_GetWrittenBlocks()` gives the newest readable block + 1.
+- `playback.c` (Core/DSP): time-expansion playback, verified on hardware 2026-10-30 (diary 37). PLAYBACK replays the last `PLAYBACK_SECONDS` (2 s) from the ring `PLAYBACK_EXPANSION` (10, in `pipeline_config.h`) times slower; press again to stop.
+  - Linear interpolation at the full 250 kHz DAC rate, after the same 10 kHz high-pass as the heterodyne. Replaces the heterodyne output while active (`DSP_ProcessBlock`); detector and waterfall stay live.
+  - The ring is paused during playback and resumes when it ends. Two 512-byte slots: one plays while the next block loads.
+  - Live Expressions: `playbackUnderruns` (should stay 0). The display shows "PLAY 10x  20s" in place of the LO readout.
 - `sd_spi.c` (FATFS/Target): SPI-mode SD driver on SPI2. FatFS is wired up through `user_diskio.c` with `_FS_TINY` on, LFN off and exFAT off, so cards must be FAT32.
 - Boot checks run before the audio starts:
   - PSRAM: hold RECORD at power-up for the full 8 MB test (~35 s).
@@ -144,7 +149,7 @@ Bugs already fixed — do not reintroduce:
   2. PSRAM bring-up. Done; the full 8 MB test is still to run once.
   3. SD bring-up. Driver written; no card available yet (Oct 30).
   4. RAM reclaim (done Oct 30), then the DMA-driven PSRAM ring buffer (verified Oct 30), then WAV recording to SD.
-  5. Time-expansion playback from PSRAM on PLAYBACK.
+  5. Time-expansion playback from PSRAM on PLAYBACK. Version 1 built (fixed 10×, last 2 s). Next: start at the detector's last bat pass; a knob-set factor.
 - Amplifier gating ("squelch"): switch `AMP_EN` on only while bats are detected.
   - Stage 1 (the monitor-only detector) is built; tune it in the field first.
   - Stage 2: drive `AMP_EN` from it, with a fade, amp off at zero volume, and forced on during playback.

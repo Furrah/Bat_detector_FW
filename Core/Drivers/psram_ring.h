@@ -59,11 +59,24 @@ PsramRing_Status_t PsramRing_Start(void);
 
 uint8_t PsramRing_IsRunning(void);
 
+/*
+ * Stop or restart recording, e.g. while playback reads the last seconds
+ * back (writing on would overwrite them). Blocks already written stay
+ * readable; blocks arriving while paused are not recorded.
+ */
+void PsramRing_SetPaused(uint8_t pause);
+
+/* Running and not paused: the block being processed now is being recorded */
+uint8_t PsramRing_IsRecording(void);
+
 /* Audio interrupt, once per block, before the DSP: queue the block for writing */
 void PsramRing_PushBlock(const uint16_t *block);
 
 /* Blocks handed over so far; the block being processed now is this minus 1 */
 uint32_t PsramRing_GetPushedBlocks(void);
+
+/* Blocks completely written: the newest readable block is this minus 1 */
+uint32_t PsramRing_GetWrittenBlocks(void);
 
 /*
  * Queue a read of one whole block into dest (PSRAM_RING_BLOCK_BYTES).

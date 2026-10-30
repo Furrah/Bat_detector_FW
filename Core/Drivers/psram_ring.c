@@ -112,8 +112,10 @@ volatile uint32_t psramRingBursts = 0;          /* bursts timed */
 volatile uint32_t psramRingResetStats = 0;
 
 static volatile uint8_t  running = 0;
+static volatile uint8_t  paused = 0;            /* not recording; reads still run */
 static volatile uint8_t  busy = 0;              /* a burst is in flight */
 static volatile uint32_t pushedBlocks = 0;
+static volatile uint32_t blockTicks = 0;        /* PushBlock calls, paused or not: the stuck-burst clock */
 
 /* The block being written. writeSource is NULL when there's none. */
 static const uint8_t * volatile writeSource = NULL;
@@ -129,7 +131,7 @@ static uint32_t readBurst = 0;
 static BurstKind_t burstKind;
 static uint32_t burstBlock;
 static uint32_t burstStart;                     /* DWT cycle count at CE# low */
-static uint32_t burstStartedAt;                 /* pushedBlocks when it started */
+static uint32_t burstStartedAt;                 /* blockTicks when it started */
 
 static uint32_t maxSelectCycles = 0;
 static uint32_t minSelectCycles = UINT32_MAX;
@@ -271,7 +273,7 @@ static __RAM_FUNC void PsramRing_StartBurst(void)
     }
 
     busy = 1U;
-    burstStartedAt = pushedBlocks;
+    burstStartedAt = blockTicks;
 
     rxChannel->CMAR = (uint32_t)rxBuffer;
     rxChannel->CNDTR = length;
@@ -398,9 +400,27 @@ uint8_t PsramRing_IsRunning(void)
 }
 
 
+void PsramRing_SetPaused(uint8_t pause)
+{
+    paused = pause;
+}
+
+
+uint8_t PsramRing_IsRecording(void)
+{
+    return running && !paused;
+}
+
+
 uint32_t PsramRing_GetPushedBlocks(void)
 {
     return pushedBlocks;
+}
+
+
+uint32_t PsramRing_GetWrittenBlocks(void)
+{
+    return psramRingBlocks;
 }
 
 
@@ -416,25 +436,31 @@ void PsramRing_PushBlock(const uint16_t *block)
     primask = __get_PRIMASK();
     __disable_irq();
 
-    /* A burst takes ~8 us; one started before the previous block arrived is stuck */
-    if(busy && (burstStartedAt != pushedBlocks))
+    /* A burst takes ~5 us; one started before the previous block arrived is
+     * stuck. Checked while paused too, so a stuck read is still recovered. */
+    if(busy && (burstStartedAt != blockTicks))
     {
         PsramRing_Fault();
     }
 
-    if(writeSource != NULL)
-    {
-        psramRingLateBlocks++;      /* the rest of the previous block is lost */
-    }
+    blockTicks++;
 
-    writeSource = (const uint8_t *)block;
-    writeBlock = pushedBlocks;
-    writeBurst = 0U;
-    pushedBlocks++;
-
-    if(!busy)
+    if(!paused)
     {
-        PsramRing_StartBurst();
+        if(writeSource != NULL)
+        {
+            psramRingLateBlocks++;      /* the rest of the previous block is lost */
+        }
+
+        writeSource = (const uint8_t *)block;
+        writeBlock = pushedBlocks;
+        writeBurst = 0U;
+        pushedBlocks++;
+
+        if(!busy)
+        {
+            PsramRing_StartBurst();
+        }
     }
 
     __set_PRIMASK(primask);

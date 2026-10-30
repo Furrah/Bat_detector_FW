@@ -483,6 +483,40 @@ Entries are in order, with the newest at the bottom. Decisions that are agreed b
   - On a Cortex-M4, running code from RAM isn't automatically fast. Ordinary SRAM shares the system bus between code and data; use the core-coupled RAM for hot code if the part has it.
   - Check the disassembly before blaming a function. The suspected `memcpy` wasn't even called.
 
+## 2026-10-30: Time-expansion playback
+
+### 37. PLAYBACK replays the last 2 s ten times slower (Oct 30)
+- **Decision:** Pressing PLAYBACK replays the last 2 s of raw audio from the PSRAM ring at 10× slower, taking 20 s; pressing again stops it. Code: `Core/DSP/playback.c`. Version 1 of plan P3.
+- **What time expansion is, and why it's worth having:**
+  - A heterodyne detector mixes the signal with a local oscillator and plays the difference. You hear only a band about ±8 kHz around the LO, folded about it, so a call's shape is mostly lost. It's live, though.
+  - Time expansion records at full bandwidth and plays it back slower. Every frequency is divided by the factor, and every duration multiplied by it: a 45 kHz pipistrelle call at 10× becomes 4.5 kHz, and a 5 ms call becomes 50 ms. The whole call survives: the FM sweep, the constant-frequency tail, harmonics and rhythm. That's the timbre the heterodyne loses, and what bat-ID work relies on.
+  - The PSRAM ring (entries 34–36) is always recording, so the bats you've just heard on the heterodyne are already stored.
+- **Why a fixed 10×, rather than scaling each call to 2 kHz:**
+  - **Pitch identifies species.** At 10×, a noctule (20 kHz) plays at 2 kHz, a pipistrelle (45 kHz) at 4.5 kHz, and a *Myotis* sweep from 8 to 3 kHz. Scaling every call to 2 kHz would make them all sound alike.
+  - **Predictable duration:** 2 s always takes 20 s. Auto-scaling a pipistrelle would need about 22×, and a lesser horseshoe (110 kHz) 55×, so 2 s would take 110 s.
+  - **10× is the convention** that reference recordings use.
+  - **It fits the hardware.** The mic's 20–80 kHz becomes 2–8 kHz, inside the speaker's range and below the amp's 6–10 kHz input filter.
+  - **Cleaner sound.** From about 20× up, the interpolation images (below) fall near 10 kHz, which is audible, and would need a proper anti-imaging filter.
+  - The engine steps through the recording with a 32-bit fractional position, so any factor works. A knob-set factor, or an automatic one, is a later option.
+- **How it works:**
+  - **Upsampling at the full DAC rate, as planned in P3.** The DAC keeps running at 250 kHz. Each output sample steps 1/10 of a sample through the recording, interpolating linearly between recorded samples. The unwanted images land around multiples of 25 kHz: ultrasonic, and filtered by the amp's input RC.
+  - **The same 10 kHz high-pass as the heterodyne path** is applied to the recorded samples first. It removes the ADC's mid-rail bias and audible room noise, which slowed 10× would become rumble below 1 kHz.
+  - **Two block buffers.** Ring blocks are read into two 512-byte slots: one plays for 10 ms while the next loads in about 0.25 ms. A block that isn't loaded in time plays as silence and is counted in `playbackUnderruns`.
+  - **The ring pauses while playback runs.** 20 s of playing would otherwise write 20 s of new audio into a 16.8 s ring, overwriting the recording being played. Blocks arriving while paused aren't recorded, and recording resumes when playback ends. The ring's stuck-burst check now counts time in blocks even while paused, so a stuck read is still recovered.
+  - **Live monitoring continues.** The heterodyne output is replaced while playback runs, and its mixer and filters are skipped. The detector, debug capture and waterfall carry on with the live input.
+  - **Gain:** the playback gain is half `DSP_GAIN`, so playback is as loud as the heterodyne for the same input (the mixer halves the amplitude). It's scaled by the volume knob as usual.
+  - **Display:** "PLAY 10x  20s" counts down where the LO readout normally is, which returns afterwards. "PLAY: no ring" appears if the PSRAM ring isn't running.
+  - **The button** is debounced over 30 ms. A press left over from the power-up SD test has to be released first.
+- **Costs:** RAM +1.1 KB (two block buffers and state), leaving about 1.7 KB free. Flash +1.3 KB. CPU: less than the heterodyne while playing; one block read per 10 ms.
+- **Alternatives considered:**
+  - **Slowing the DAC clock to 25 kHz:** the images would land in the audio band (P3).
+  - **Keeping the ring recording during playback:** only possible if the segment × factor stays under the ring's 16.8 s (1.6 s at 10×, 0.8 s at 20×).
+  - **Auto-scaling each call to 2 kHz:** see above.
+- **Outcome:** Works on hardware first time. Ultrasound made near the mic (keys, fingertips) plays back slowed and lower, the countdown and stop work, and the LO readout returns. Measured: `playbackUnderruns` 0, ring faults 0, no bursts over tCEM, and the DSP's worst-case load unchanged at 46%. `capture.py verify` passes afterwards (160 KB identical), so the ring records normally again.
+- **Lessons for future designs:**
+  - Pick the time-expansion factor from the whole chain's passband (mic to 80 kHz, the amp's 6–10 kHz input filter, the speaker), not from a target pitch alone.
+  - An always-on recording buffer makes features like this cheap. Playback needed no new capture path, only a reader.
+
 ---
 
 ## Planned decisions (agreed, not built yet)
@@ -496,7 +530,7 @@ Entries are in order, with the newest at the bottom. Decisions that are agreed b
   - The SD writer and playback send read requests to it.
 - **Why:** SD cards can stall for 100–250 ms while erasing. At 500 kB/s that's up to 125 KB of audio, far more than the RAM. The PSRAM absorbs it.
 
-### P3. Time expansion by upsampling at the full DAC rate (planned)
+### P3. Time expansion by upsampling at the full DAC rate (version 1 built, entry 37)
 - **Plan:** When PLAYBACK is pressed, freeze the ring buffer. Then replay it 10× slower by interpolating samples at the full 250 kHz DAC rate, rather than slowing the DAC clock.
 - **Why:**
   - Upsampling puts the unwanted image frequencies near 250 kHz. A slowed DAC (25 kHz) would put them in the audio band (25 kHz minus the tone), where the amplifier's ~6–10 kHz RC filter only partly removes them.
@@ -557,6 +591,7 @@ Entries are in order, with the newest at the bottom. Decisions that are agreed b
 - Measure an interrupt's CPU cost under its heaviest load before making it run more often (entry 36).
 - On a Cortex-M4, put hot code in core-coupled RAM if the part has it: ordinary SRAM shares the bus between code and data (entry 36).
 - Check the disassembly before blaming a function (entry 36).
+- Choose a time-expansion factor from the whole output chain's passband, not just a target pitch (entry 37).
 
 ---
 

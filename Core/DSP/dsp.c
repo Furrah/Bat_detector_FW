@@ -10,6 +10,7 @@
 #include "dsp_filters.h"
 #include "fft.h"
 #include "bat_detect.h"
+#include "playback.h"
 #include "debug_link.h"
 #include <math.h>
 
@@ -74,6 +75,10 @@ void DSP_ProcessBlock(
     // energy above the 10 kHz high-pass, for the bat detector
     float energy = 0.0f;
 
+    // time-expansion playback replaces the heterodyne output while it runs;
+    // the detector, debug capture and waterfall stay on the live input
+    const uint8_t playing = Playback_IsActive();
+
     for(uint32_t i=0;i<length;i++)
     {
 
@@ -84,6 +89,11 @@ void DSP_ProcessBlock(
         // the high-pass output feeds both the heterodyne and the detector
         float highPassed = Biquad_Process(&high_pass,(float)sample);
         energy += highPassed * highPassed;
+
+        if(playing)
+        {
+            continue;
+        }
 
         sample = (int32_t)highPassed;
         sample *= DSP_GAIN;
@@ -100,6 +110,11 @@ void DSP_ProcessBlock(
 
 
 
+    }
+
+    if(playing)
+    {
+        Playback_Render(output, length, gain);
     }
 
     BatDetect_ProcessBlock(energy);

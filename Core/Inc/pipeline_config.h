@@ -50,4 +50,13 @@ _Static_assert(((AUDIO_BLOCK_SIZE * 1000000UL) % AUDIO_SAMPLE_RATE_HZ) == 0UL,
 _Static_assert(AUDIO_LO_MAX_HZ < AUDIO_NYQUIST_HZ, "LO must stay below Nyquist");
 
 
+/*
+ * Time-expansion playback replays the recording this many times slower,
+ * dividing every frequency by it: a 45 kHz call plays at 4.5 kHz.
+ */
+#define PLAYBACK_EXPANSION      10U
+
+_Static_assert(PLAYBACK_EXPANSION >= 2U, "playback must be slower than real time");
+
+
 #endif /* PIPELINE_CONFIG_H_ */
