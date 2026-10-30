@@ -20,8 +20,8 @@ extern SPI_HandleTypeDef ILI9341_SPI_PORT;
 
 #define ILI9341_RES_Pin       DISPLAY_RESET_Pin
 #define ILI9341_RES_GPIO_Port DISPLAY_RESET_GPIO_Port
-#define ILI9341_CS_Pin        SPI_CS_Pin
-#define ILI9341_CS_GPIO_Port  SPI_CS_GPIO_Port
+#define ILI9341_CS_Pin        SPI2_DISPLAY_CS_Pin
+#define ILI9341_CS_GPIO_Port  SPI2_DISPLAY_CS_GPIO_Port
 #define ILI9341_DC_Pin        DISPLAY_DC_Pin
 #define ILI9341_DC_GPIO_Port  DISPLAY_DC_GPIO_Port
 

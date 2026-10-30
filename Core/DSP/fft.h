@@ -32,6 +32,5 @@ void FFT_Process(void);
 extern volatile uint8_t fftMagnitudeReady;
 extern volatile uint32_t fftDroppedBlocks;
 extern float fftMagnitude[FFT_NUM_BINS];
-static void GenerateWindow(void);
 
 #endif /* DSP_FFT_H_ */

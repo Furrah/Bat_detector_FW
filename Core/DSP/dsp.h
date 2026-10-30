@@ -46,6 +46,12 @@ void DSP_ProcessBlock(
 
 void DSP_SetMixerFrequency(float frequency);
 
+/*
+ * Output volume from the volume knob position, 0.0 (min) to 1.0 (max).
+ * A square-law taper is applied so the knob sounds roughly even.
+ */
+void DSP_SetVolume(float position);
+
 
 int32_t DSP_Mixer(int32_t sample);
 

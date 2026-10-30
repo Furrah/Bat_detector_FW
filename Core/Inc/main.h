@@ -49,8 +49,6 @@ extern "C" {
 
 /* USER CODE END EM */
 
-void HAL_TIM_MspPostInit(TIM_HandleTypeDef *htim);
-
 /* Exported functions prototypes ---------------------------------------------*/
 void Error_Handler(void);
 
@@ -59,22 +57,28 @@ void Error_Handler(void);
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/
-#define MUX_SELECT_Pin GPIO_PIN_2
-#define MUX_SELECT_GPIO_Port GPIOA
-#define DISPLAY_RESET_Pin GPIO_PIN_0
+#define RECORD_BUTTON_Pin GPIO_PIN_2
+#define RECORD_BUTTON_GPIO_Port GPIOA
+#define PLAYBACK_BUTTON_Pin GPIO_PIN_3
+#define PLAYBACK_BUTTON_GPIO_Port GPIOA
+#define SPI1_PSRAM_CS_Pin GPIO_PIN_0
+#define SPI1_PSRAM_CS_GPIO_Port GPIOB
+#define SPI2_SD_CARD_CS_Pin GPIO_PIN_2
+#define SPI2_SD_CARD_CS_GPIO_Port GPIOB
+#define AMP_EN_Pin GPIO_PIN_10
+#define AMP_EN_GPIO_Port GPIOB
+#define DISPLAY_RESET_Pin GPIO_PIN_11
 #define DISPLAY_RESET_GPIO_Port GPIOB
-#define DISPLAY_DC_Pin GPIO_PIN_1
+#define DISPLAY_DC_Pin GPIO_PIN_12
 #define DISPLAY_DC_GPIO_Port GPIOB
-#define SPI_CS_Pin GPIO_PIN_12
-#define SPI_CS_GPIO_Port GPIOB
+#define SPI2_DISPLAY_CS_Pin GPIO_PIN_8
+#define SPI2_DISPLAY_CS_GPIO_Port GPIOA
 #define DISPLAY_LED_Pin GPIO_PIN_9
 #define DISPLAY_LED_GPIO_Port GPIOA
-#define LED0_Pin GPIO_PIN_5
-#define LED0_GPIO_Port GPIOB
 #define LED1_Pin GPIO_PIN_6
 #define LED1_GPIO_Port GPIOB
-#define LED2_Pin GPIO_PIN_7
-#define LED2_GPIO_Port GPIOB
+#define LED0_Pin GPIO_PIN_7
+#define LED0_GPIO_Port GPIOB
 
 /* USER CODE BEGIN Private defines */
 

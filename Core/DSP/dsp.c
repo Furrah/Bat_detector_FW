@@ -18,6 +18,8 @@ static uint32_t phaseIncrement;
 
 static float loFrequency = 38000.0f;
 
+static volatile float volumeGain = 0.0f;    // silent until the knob is first read
+
 static DSP_Callback_t outputCallback = 0;
 
 static Biquad_t lowPass1;
@@ -64,6 +66,9 @@ void DSP_ProcessBlock(
 {
     static uint16_t output[DSP_BLOCK_SIZE];
 
+    // one gain per block; written from the main loop
+    const float gain = volumeGain;
+
     for(uint32_t i=0;i<length;i++)
     {
 
@@ -77,7 +82,8 @@ void DSP_ProcessBlock(
         sample = DSP_Mixer(sample);
 
         sample =Biquad_Process(&lowPass1,(float)sample);
-        sample =Biquad_Process(&lowPass2,(float)sample);
+        // volume applied before the float -> int truncation
+        sample =(int32_t)(Biquad_Process(&lowPass2,(float)sample) * gain);
 
         sample = DSP_clamp_output(sample);
 
@@ -127,6 +133,18 @@ void DSP_SetMixerFrequency(float frequency)
     loFrequency = frequency;
 
     phaseIncrement = DSP_calc_phase_increment(frequency,SAMPLE_RATE );
+}
+
+
+void DSP_SetVolume(float position)
+{
+    if(position < 0.0f)
+        position = 0.0f;
+
+    if(position > 1.0f)
+        position = 1.0f;
+
+    volumeGain = position * position;
 }
 
 uint32_t DSP_calc_phase_increment(float frequency, float sample_rate){

@@ -24,25 +24,32 @@ static ADC_Callback_t fullCallback = 0;
 volatile uint32_t adcConversionCount = 0;
 
 
+static uint16_t adc2Buffer[ADC2_NUM_CHANNELS];
+static volatile uint8_t adc2ScanReady = 0;
+
+
 
 void ADC_Init(void)
 {
     HAL_ADCEx_Calibration_Start(
             &hadc1,
             ADC_SINGLE_ENDED);
+
+    HAL_ADCEx_Calibration_Start(
+            &hadc2,
+            ADC_SINGLE_ENDED);
+
+    /* ADC2_Channel_t must mirror the CubeMX ADC2 rank list */
+    if(hadc2.Init.NbrOfConversion != ADC2_NUM_CHANNELS)
+    {
+        Error_Handler();
+    }
 }
 
 
 void ADC_Start(void)
 {
-    uint32_t state;
-
-    state = HAL_ADC_GetState(&hadc1);
-
-
-    HAL_StatusTypeDef status;
-
-    status = HAL_ADC_Start_DMA(
+    HAL_ADC_Start_DMA(
             &hadc1,
             (uint32_t*)adcBuffer,
             ADC_BUFFER_SIZE);
@@ -101,15 +108,36 @@ void HAL_ADC_ConvCpltCallback(
         	    ADC_BUFFER_SIZE/2);
         }
     }
+    else if(hadc == &hadc2)
+    {
+        adc2ScanReady = 1;
+    }
 }
 
 
-uint16_t ADC2_Read(void)
+/*
+ * Start one scan of all ADC2 ranks into adc2Buffer via DMA1 Ch3.
+ * Non-blocking; three 247.5-cycle conversions take ~18 us.
+ */
+void ADC2_StartScan(void)
 {
-    HAL_ADC_Start(&hadc2);
+    adc2ScanReady = 0;
 
-    HAL_ADC_PollForConversion(&hadc2, HAL_MAX_DELAY);
+    HAL_ADC_Start_DMA(
+            &hadc2,
+            (uint32_t*)adc2Buffer,
+            ADC2_NUM_CHANNELS);
+}
 
-    return HAL_ADC_GetValue(&hadc2);
+
+uint8_t ADC2_ScanReady(void)
+{
+    return adc2ScanReady;
+}
+
+
+uint16_t ADC2_Get(ADC2_Channel_t channel)
+{
+    return adc2Buffer[channel];
 }
 

@@ -18,6 +18,7 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "app_fatfs.h"
 #include "usb_device.h"
 
 /* Private includes ----------------------------------------------------------*/
@@ -28,10 +29,10 @@
 #include "adc.h"
 #include "dsp.h"
 #include "dac.h"
+#include "psram.h"
 #include "tim3_lo.h"
 #include "fft.h"
 #include "ili9341.h"
-#include "ili9341_touch.h"
 #include "fonts.h"
 
 #include "waterfall.h"
@@ -46,6 +47,16 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 
+#define VDDA_MV            3300U   // ADC reference: VDDA = 3V3 rail
+#define VBAT_DIVIDER       2U      // R21/R22, 1M/1M
+#define VBAT_UPDATE_MS     1000U
+
+// Battery readout sits in the top-right of the waterfall header as two
+// Font_7x10 lines. The LO label (up to 13 chars of Font_16x26 from x=5)
+// ends at x=213, which leaves too little room for "3.9V" on one line.
+#define VBAT_TEXT_X        218U
+#define VBAT_TEXT_Y        5U
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -57,10 +68,14 @@
 ADC_HandleTypeDef hadc1;
 ADC_HandleTypeDef hadc2;
 DMA_HandleTypeDef hdma_adc1;
+DMA_HandleTypeDef hdma_adc2;
 
 DAC_HandleTypeDef hdac1;
 DMA_HandleTypeDef hdma_dac1_ch1;
 
+RTC_HandleTypeDef hrtc;
+
+SPI_HandleTypeDef hspi1;
 SPI_HandleTypeDef hspi2;
 
 TIM_HandleTypeDef htim2;
@@ -80,6 +95,8 @@ static void MX_TIM3_Init(void);
 static void MX_SPI2_Init(void);
 static void MX_ADC2_Init(void);
 static void MX_TIM2_Init(void);
+static void MX_SPI1_Init(void);
+static void MX_RTC_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -101,6 +118,64 @@ static void MX_TIM2_Init(void);
 
 
 
+
+/*
+ * PSRAM bring-up check, run once at boot before the audio pipeline starts,
+ * so SPI1 is otherwise idle. The address-line test always runs (a few ms).
+ * The full 8 MB pattern test runs only if RECORD is held at power-up,
+ * because the polled -O0 driver takes ~35 s for it.
+ */
+static void PSRAM_BootCheck(void)
+{
+    char text[24];
+    uint8_t mfid;
+    uint8_t kgd;
+    uint32_t failAddress = 0;
+    uint32_t selectNs;
+    uint8_t fullTest = (HAL_GPIO_ReadPin(RECORD_BUTTON_GPIO_Port, RECORD_BUTTON_Pin) == GPIO_PIN_RESET);
+
+    PSRAM_Status_t status = PSRAM_Init();
+
+    PSRAM_GetId(&mfid, &kgd);
+    snprintf(text, sizeof(text), "PSRAM ID %02X %02X", mfid, kgd);
+    ILI9341_WriteString(5, 40, text, Font_11x18, ILI9341_WHITE, ILI9341_BLACK);
+
+    if(status == PSRAM_OK)
+    {
+        if(fullTest)
+        {
+            ILI9341_WriteString(5, 65, "Full test ~35s...", Font_11x18, ILI9341_WHITE, ILI9341_BLACK);
+            status = PSRAM_TestFull(&failAddress);
+        }
+        else
+        {
+            status = PSRAM_TestAddressLines(&failAddress);
+        }
+    }
+
+    if(status == PSRAM_OK)
+    {
+        ILI9341_WriteString(5, 90, fullTest ? "8MB test OK" : "Address test OK",
+                Font_11x18, ILI9341_GREEN, ILI9341_BLACK);
+    }
+    else if(status == PSRAM_ERR_ID)
+    {
+        ILI9341_WriteString(5, 90, "FAIL: bad ID", Font_11x18, ILI9341_RED, ILI9341_BLACK);
+    }
+    else
+    {
+        snprintf(text, sizeof(text), "FAIL at 0x%06lX", failAddress);
+        ILI9341_WriteString(5, 90, text, Font_11x18, ILI9341_RED, ILI9341_BLACK);
+    }
+
+    // CE# low time must stay within tCEM, or the PSRAM can't refresh
+    selectNs = PSRAM_GetMaxSelectNs();
+    snprintf(text, sizeof(text), "CE max %lu.%lu us", selectNs / 1000U, (selectNs % 1000U) / 100U);
+    ILI9341_WriteString(5, 115, text, Font_11x18,
+            (selectNs > PSRAM_TCEM_NS) ? ILI9341_RED : ILI9341_WHITE, ILI9341_BLACK);
+
+    HAL_Delay((status == PSRAM_OK) ? 1500U : 5000U);
+}
 
 /* USER CODE END 0 */
 
@@ -141,6 +216,11 @@ int main(void)
   MX_SPI2_Init();
   MX_ADC2_Init();
   MX_TIM2_Init();
+  MX_SPI1_Init();
+  MX_RTC_Init();
+  if (MX_FATFS_Init() != APP_OK) {
+    Error_Handler();
+  }
   /* USER CODE BEGIN 2 */
 
   // Enable Flush-to-Zero (FZ) mode on the Cortex-M4 FPU
@@ -153,12 +233,19 @@ int main(void)
   FFT_Init();
 
 
+  // MX_GPIO_Init leaves every SPI chip-select low. Deselect SD and PSRAM
+  // before the first SPI2 transfer so the SD card doesn't see display traffic.
+  HAL_GPIO_WritePin(SPI2_SD_CARD_CS_GPIO_Port, SPI2_SD_CARD_CS_Pin, GPIO_PIN_SET);
+  HAL_GPIO_WritePin(SPI1_PSRAM_CS_GPIO_Port, SPI1_PSRAM_CS_Pin, GPIO_PIN_SET);
   ILI9341_Unselect();
-  ILI9341_TouchUnselect();
   ILI9341_Init();
 
   HAL_GPIO_WritePin(DISPLAY_LED_GPIO_Port, DISPLAY_LED_Pin, GPIO_PIN_SET); // turn screen on
   ILI9341_FillScreen(ILI9341_BLACK);
+
+  // Hold RECORD at power-up for the full 8 MB test. Waterfall_Init clears
+  // the result off the screen afterwards.
+  PSRAM_BootCheck();
 
   Waterfall_Init();
   Waterfall_SetRange(-10.0f, 20.0f);
@@ -176,7 +263,9 @@ int main(void)
 
   ADC_Start();
 
-
+  // TS4990 is held in standby by R9 until AMP_EN goes high. Enable it only
+  // once the DAC is already outputting mid-scale, to avoid a turn-on pop.
+  HAL_GPIO_WritePin(AMP_EN_GPIO_Port, AMP_EN_Pin, GPIO_PIN_SET);
 
 
   /* USER CODE END 2 */
@@ -193,8 +282,9 @@ int main(void)
   char text[32];
 
   uint32_t last_flush_tick = HAL_GetTick();
-  uint32_t test_frame = 0;
-  static float test_mag[512];
+  uint32_t last_vbat_tick = HAL_GetTick();
+  uint32_t vbat_sum = 0;
+  uint32_t vbat_count = 0;
 
   Waterfall_SetLOFrequency(frequency);
 
@@ -206,7 +296,21 @@ int main(void)
 	    {
 	        lastRead = HAL_GetTick();
 
-	        uint16_t adc = ADC2_Read();
+	        // Use the scan started on the previous tick, then start the next one.
+	        // No result yet means no change.
+	        uint16_t adc = lastADC;
+
+	        if(ADC2_ScanReady())
+	        {
+	            adc = ADC2_Get(ADC2_LO_POT);
+
+	            DSP_SetVolume((float)ADC2_Get(ADC2_VOLUME) / 4095.0f);
+
+	            vbat_sum += ADC2_Get(ADC2_VBAT);
+	            vbat_count++;
+	        }
+
+	        ADC2_StartScan();
 
 	        if(abs((int)adc - (int)lastADC) > 16)
 	        {
@@ -219,19 +323,16 @@ int main(void)
 	            {
 	                HAL_GPIO_WritePin(GPIOB, LED0_Pin, GPIO_PIN_SET);
 	                HAL_GPIO_WritePin(GPIOB, LED1_Pin, GPIO_PIN_RESET);
-	                HAL_GPIO_WritePin(GPIOB, LED2_Pin, GPIO_PIN_RESET);
 	            }
 	            else if(frequency >= 30000U)
 	            {
 	                HAL_GPIO_WritePin(GPIOB, LED0_Pin, GPIO_PIN_RESET);
 	                HAL_GPIO_WritePin(GPIOB, LED1_Pin, GPIO_PIN_SET);
-	                HAL_GPIO_WritePin(GPIOB, LED2_Pin, GPIO_PIN_RESET);
 	            }
 	            else
 	            {
 	                HAL_GPIO_WritePin(GPIOB, LED0_Pin, GPIO_PIN_RESET);
 	                HAL_GPIO_WritePin(GPIOB, LED1_Pin, GPIO_PIN_RESET);
-	                HAL_GPIO_WritePin(GPIOB, LED2_Pin, GPIO_PIN_SET);
 	            }
 
 
@@ -255,6 +356,21 @@ int main(void)
 	    if ((now - last_flush_tick) >= 40) {
 	        Waterfall_FlushRow();
 	        last_flush_tick = now;
+	    }
+
+	    // Battery: average the 10 ms readings over each second. Ratiometric to
+	    // VDDA, so it reads high once the MCP1700 drops out near empty.
+	    if ((now - last_vbat_tick) >= VBAT_UPDATE_MS && vbat_count > 0) {
+	        uint32_t vbat_mv = (vbat_sum / vbat_count) * VDDA_MV * VBAT_DIVIDER / 4095U;
+	        uint32_t tenths = (vbat_mv + 50U) / 100U;
+
+	        snprintf(text, sizeof(text), "%lu.%lu", tenths / 10U, tenths % 10U);
+	        ILI9341_WriteString(VBAT_TEXT_X, VBAT_TEXT_Y, "BAT", Font_7x10, ILI9341_WHITE, ILI9341_BLACK);
+	        ILI9341_WriteString(VBAT_TEXT_X, VBAT_TEXT_Y + 12U, text, Font_7x10, ILI9341_WHITE, ILI9341_BLACK);
+
+	        vbat_sum = 0;
+	        vbat_count = 0;
+	        last_vbat_tick = now;
 	    }
 
 
@@ -302,7 +418,7 @@ void SystemClock_Config(void)
                               |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
   RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
   RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
-  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
   RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
 
   if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_4) != HAL_OK)
@@ -404,11 +520,11 @@ static void MX_ADC2_Init(void)
   hadc2.Init.Resolution = ADC_RESOLUTION_12B;
   hadc2.Init.DataAlign = ADC_DATAALIGN_RIGHT;
   hadc2.Init.GainCompensation = 0;
-  hadc2.Init.ScanConvMode = ADC_SCAN_DISABLE;
+  hadc2.Init.ScanConvMode = ADC_SCAN_ENABLE;
   hadc2.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
   hadc2.Init.LowPowerAutoWait = DISABLE;
   hadc2.Init.ContinuousConvMode = DISABLE;
-  hadc2.Init.NbrOfConversion = 1;
+  hadc2.Init.NbrOfConversion = 3;
   hadc2.Init.DiscontinuousConvMode = DISABLE;
   hadc2.Init.ExternalTrigConv = ADC_SOFTWARE_START;
   hadc2.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
@@ -424,10 +540,28 @@ static void MX_ADC2_Init(void)
   */
   sConfig.Channel = ADC_CHANNEL_2;
   sConfig.Rank = ADC_REGULAR_RANK_1;
-  sConfig.SamplingTime = ADC_SAMPLETIME_2CYCLES_5;
+  sConfig.SamplingTime = ADC_SAMPLETIME_247CYCLES_5;
   sConfig.SingleDiff = ADC_SINGLE_ENDED;
   sConfig.OffsetNumber = ADC_OFFSET_NONE;
   sConfig.Offset = 0;
+  if (HAL_ADC_ConfigChannel(&hadc2, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Regular Channel
+  */
+  sConfig.Channel = ADC_CHANNEL_13;
+  sConfig.Rank = ADC_REGULAR_RANK_2;
+  if (HAL_ADC_ConfigChannel(&hadc2, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Regular Channel
+  */
+  sConfig.Channel = ADC_CHANNEL_3;
+  sConfig.Rank = ADC_REGULAR_RANK_3;
   if (HAL_ADC_ConfigChannel(&hadc2, &sConfig) != HAL_OK)
   {
     Error_Handler();
@@ -486,6 +620,112 @@ static void MX_DAC1_Init(void)
 }
 
 /**
+  * @brief RTC Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_RTC_Init(void)
+{
+
+  /* USER CODE BEGIN RTC_Init 0 */
+
+  /* USER CODE END RTC_Init 0 */
+
+  RTC_TimeTypeDef sTime = {0};
+  RTC_DateTypeDef sDate = {0};
+
+  /* USER CODE BEGIN RTC_Init 1 */
+
+  /* USER CODE END RTC_Init 1 */
+
+  /** Initialize RTC Only
+  */
+  hrtc.Instance = RTC;
+  hrtc.Init.HourFormat = RTC_HOURFORMAT_24;
+  hrtc.Init.AsynchPrediv = 127;
+  hrtc.Init.SynchPrediv = 255;
+  hrtc.Init.OutPut = RTC_OUTPUT_DISABLE;
+  hrtc.Init.OutPutRemap = RTC_OUTPUT_REMAP_NONE;
+  hrtc.Init.OutPutPolarity = RTC_OUTPUT_POLARITY_HIGH;
+  hrtc.Init.OutPutType = RTC_OUTPUT_TYPE_OPENDRAIN;
+  hrtc.Init.OutPutPullUp = RTC_OUTPUT_PULLUP_NONE;
+  if (HAL_RTC_Init(&hrtc) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /* USER CODE BEGIN Check_RTC_BKUP */
+
+  /* USER CODE END Check_RTC_BKUP */
+
+  /** Initialize RTC and set the Time and Date
+  */
+  sTime.Hours = 0x0;
+  sTime.Minutes = 0x0;
+  sTime.Seconds = 0x0;
+  sTime.SubSeconds = 0x0;
+  sTime.DayLightSaving = RTC_DAYLIGHTSAVING_NONE;
+  sTime.StoreOperation = RTC_STOREOPERATION_RESET;
+  if (HAL_RTC_SetTime(&hrtc, &sTime, RTC_FORMAT_BCD) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sDate.WeekDay = RTC_WEEKDAY_MONDAY;
+  sDate.Month = RTC_MONTH_JANUARY;
+  sDate.Date = 0x1;
+  sDate.Year = 0x0;
+
+  if (HAL_RTC_SetDate(&hrtc, &sDate, RTC_FORMAT_BCD) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN RTC_Init 2 */
+
+  /* USER CODE END RTC_Init 2 */
+
+}
+
+/**
+  * @brief SPI1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_SPI1_Init(void)
+{
+
+  /* USER CODE BEGIN SPI1_Init 0 */
+
+  /* USER CODE END SPI1_Init 0 */
+
+  /* USER CODE BEGIN SPI1_Init 1 */
+
+  /* USER CODE END SPI1_Init 1 */
+  /* SPI1 parameter configuration*/
+  hspi1.Instance = SPI1;
+  hspi1.Init.Mode = SPI_MODE_MASTER;
+  hspi1.Init.Direction = SPI_DIRECTION_2LINES;
+  hspi1.Init.DataSize = SPI_DATASIZE_8BIT;
+  hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
+  hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
+  hspi1.Init.NSS = SPI_NSS_SOFT;
+  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_4;
+  hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
+  hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
+  hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
+  hspi1.Init.CRCPolynomial = 7;
+  hspi1.Init.CRCLength = SPI_CRC_LENGTH_DATASIZE;
+  hspi1.Init.NSSPMode = SPI_NSS_PULSE_ENABLE;
+  if (HAL_SPI_Init(&hspi1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN SPI1_Init 2 */
+
+  /* USER CODE END SPI1_Init 2 */
+
+}
+
+/**
   * @brief SPI2 Initialization Function
   * @param None
   * @retval None
@@ -508,7 +748,7 @@ static void MX_SPI2_Init(void)
   hspi2.Init.CLKPolarity = SPI_POLARITY_LOW;
   hspi2.Init.CLKPhase = SPI_PHASE_1EDGE;
   hspi2.Init.NSS = SPI_NSS_SOFT;
-  hspi2.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_8;
+  hspi2.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_4;
   hspi2.Init.FirstBit = SPI_FIRSTBIT_MSB;
   hspi2.Init.TIMode = SPI_TIMODE_DISABLE;
   hspi2.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
@@ -546,7 +786,7 @@ static void MX_TIM2_Init(void)
   htim2.Instance = TIM2;
   htim2.Init.Prescaler = 0;
   htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim2.Init.Period = 884;
+  htim2.Init.Period = 679;
   htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
   if (HAL_TIM_Base_Init(&htim2) != HAL_OK)
@@ -584,7 +824,6 @@ static void MX_TIM3_Init(void)
 
   TIM_ClockConfigTypeDef sClockSourceConfig = {0};
   TIM_MasterConfigTypeDef sMasterConfig = {0};
-  TIM_OC_InitTypeDef sConfigOC = {0};
 
   /* USER CODE BEGIN TIM3_Init 1 */
 
@@ -604,28 +843,15 @@ static void MX_TIM3_Init(void)
   {
     Error_Handler();
   }
-  if (HAL_TIM_PWM_Init(&htim3) != HAL_OK)
-  {
-    Error_Handler();
-  }
   sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
   sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
   if (HAL_TIMEx_MasterConfigSynchronization(&htim3, &sMasterConfig) != HAL_OK)
   {
     Error_Handler();
   }
-  sConfigOC.OCMode = TIM_OCMODE_PWM1;
-  sConfigOC.Pulse = 1889;
-  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
-  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
-  if (HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
-  {
-    Error_Handler();
-  }
   /* USER CODE BEGIN TIM3_Init 2 */
 
   /* USER CODE END TIM3_Init 2 */
-  HAL_TIM_MspPostInit(&htim3);
 
 }
 
@@ -646,6 +872,9 @@ static void MX_DMA_Init(void)
   /* DMA1_Channel2_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(DMA1_Channel2_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(DMA1_Channel2_IRQn);
+  /* DMA1_Channel3_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Channel3_IRQn, 3, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Channel3_IRQn);
 
 }
 
@@ -667,26 +896,40 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOB, DISPLAY_RESET_Pin|DISPLAY_DC_Pin|SPI_CS_Pin|LED0_Pin
-                          |LED1_Pin|LED2_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOB, SPI1_PSRAM_CS_Pin|SPI2_SD_CARD_CS_Pin|AMP_EN_Pin|DISPLAY_RESET_Pin
+                          |DISPLAY_DC_Pin|LED1_Pin|LED0_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(DISPLAY_LED_GPIO_Port, DISPLAY_LED_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOA, SPI2_DISPLAY_CS_Pin|DISPLAY_LED_Pin, GPIO_PIN_RESET);
 
-  /*Configure GPIO pin : MUX_SELECT_Pin */
-  GPIO_InitStruct.Pin = MUX_SELECT_Pin;
+  /*Configure GPIO pins : RECORD_BUTTON_Pin PLAYBACK_BUTTON_Pin */
+  GPIO_InitStruct.Pin = RECORD_BUTTON_Pin|PLAYBACK_BUTTON_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(MUX_SELECT_GPIO_Port, &GPIO_InitStruct);
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : DISPLAY_RESET_Pin DISPLAY_DC_Pin SPI_CS_Pin LED0_Pin
-                           LED1_Pin LED2_Pin */
-  GPIO_InitStruct.Pin = DISPLAY_RESET_Pin|DISPLAY_DC_Pin|SPI_CS_Pin|LED0_Pin
-                          |LED1_Pin|LED2_Pin;
+  /*Configure GPIO pins : SPI1_PSRAM_CS_Pin SPI2_SD_CARD_CS_Pin */
+  GPIO_InitStruct.Pin = SPI1_PSRAM_CS_Pin|SPI2_SD_CARD_CS_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : AMP_EN_Pin DISPLAY_RESET_Pin DISPLAY_DC_Pin LED1_Pin
+                           LED0_Pin */
+  GPIO_InitStruct.Pin = AMP_EN_Pin|DISPLAY_RESET_Pin|DISPLAY_DC_Pin|LED1_Pin
+                          |LED0_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : SPI2_DISPLAY_CS_Pin */
+  GPIO_InitStruct.Pin = SPI2_DISPLAY_CS_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+  HAL_GPIO_Init(SPI2_DISPLAY_CS_GPIO_Port, &GPIO_InitStruct);
 
   /*Configure GPIO pin : DISPLAY_LED_Pin */
   GPIO_InitStruct.Pin = DISPLAY_LED_Pin;

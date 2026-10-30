@@ -1,0 +1,111 @@
+# Bat detector — STM32G431 firmware
+
+Handheld, battery-powered ultrasonic bat detector covering the 20–120 kHz echolocation band (common pipistrelle ~45 kHz; highest frequency that must be detected: 100 kHz). It's a learning project in analogue + digital electronics; the commercial benchmark is the Pipistrelle Mini (heterodyne, auto-tune, time expansion, spectrum display, microSD), and the aim is to beat it on capability at a competitive cost. V1 PCB works; the V2 board (4 layers) is built and the firmware is being ported to it (from Oct 2026).
+
+- MCU: STM32G431CBT6 (LQFP48), 128 KB flash, 32 KB RAM
+- Schematic: `bat_detector_circuit.pdf` (V2)
+- Tools: STM32CubeIDE 2.1.1 + STM32CubeMX, HAL + DMA/DMAMUX, KiCad 10, LTspice
+- Build: `make -C Debug all` with CubeIDE's bundled make and GCC on PATH: `C:/ST/STM32CubeIDE_2.1.1/STM32CubeIDE/plugins/com.st.stm32cube.ide.mcu.externaltools.make.win32_*/tools/bin` and `.../com.st.stm32cube.ide.mcu.externaltools.gnu-tools-for-stm32.*/tools/bin`. Flash/debug stays in CubeIDE.
+
+## Rules for changing code
+
+- CubeMX-generated files: only edit inside `/* USER CODE BEGIN */ … /* USER CODE END */` blocks. Anything outside is wiped when the .ioc is regenerated.
+- Make incremental, targeted changes scoped to the function or module in question, with the rationale stated. No whole-file rewrites.
+- RAM is tight: ~6.4 KB free (26.2 KB used incl. 1.5 KB heap+stack). Flash is not: ~55 KB of 128 KB free, so large constant tables belong in flash. No malloc, no large stack buffers. Check the .map (or `arm-none-eabi-size`) after changes that add buffers or tables.
+- Do not add the prebuilt CMSIS-DSP library: the static archive bakes in every twiddle table and overflowed flash by ~9 KB. The FFT is hand-rolled on purpose. If CMSIS-DSP is ever needed, use the source-only library so size-reduction defines work.
+- Buffer sizes and the sample rate must derive from one authoritative constant (e.g. `AUDIO_BLOCK_SIZE` in `pipeline_config.h`). Never hard-code a block size. That header doesn't exist yet: today `ADC_BUFFER_SIZE`, `DAC_BUFFER_SIZE` and `DSP_BLOCK_SIZE` are separate defines, and the sample rate is defined three times (see Firmware state).
+- Shared ISR state (ping-pong FIFO counters etc.) needs short critical sections (`__disable_irq()` / `__set_PRIMASK()`). For FFT block handoff, drop rather than corrupt.
+- DSP correctness is verified by cross-checking against numpy `rfft` on captured raw samples. Offer a numpy check when changing DSP code.
+- Back analysis with numbers (GBP, noise, throughput, timing) and give honest trade-offs rather than reassurance.
+- When debugging peripherals, reason from register reads (`DMA1->ISR`, `CNDTR`, `CCR`, `DAC1->CR`, `DAC1->SR`, DMAMUX `CCR`) decoded to bit-field level.
+
+## Hardware (v2)
+
+- Mic: SPVA1A0LR5H-1 MEMS (rated to ~80 kHz) on J1. Front end: a single OPA365 non-inverting stage, fixed gain 1 + (39k + 100k)/1k = 140×, biased to mid-rail. No gain pot.
+- At the ADC pin: 33 Ω + 1 nF (corner ~4.8 MHz). This is a charge reservoir for the ADC, not an anti-alias filter. Op-amp closed-loop bandwidth is ~360 kHz, so anything above Nyquist aliases.
+- No analogue mixer: heterodyne is fully digital. TIM3 (V1's LO square wave) has no job on V2.
+- SPI1: APS6404L 8 MB PSRAM, alone on the bus. Planned as the continuous pre-trigger ring buffer and the time-expansion source.
+  - Above 33 MHz, reads must use Fast Read `0x0B`; plain Read `0x03` is limited to 33 MHz.
+  - CE# may stay low for at most tCEM = 8 µs (refresh). At 42.5 MHz that limits bursts to ~32 bytes.
+- SPI2: ILI9341 2.4" TFT + its on-module SD slot, shared. The display has its own CS on V2. SD MOSI/CLK go through 33 Ω. No touch controller is wired.
+- SD card runs in SPI mode (G431 has no SDMMC). USB-C exposes the card via USB device MSC. FatFS and USB MSC must never access the card at the same time (needs a mutual-exclusion state machine).
+- Power: system always runs from the 3.7 V LiPo (MCP73831 charger; USB only charges). There is no 5 V rail.
+  - The MCP1700 LDO is always on. The S1 slide switch sits between the LDO output and the 3V3 rail.
+  - No VBUS sense reaches the MCU, so USB attach has to be inferred from USB reset/suspend events.
+  - J7 "BYPASS" shorts USB 5 V onto the battery node. Never fit it with a cell connected.
+- Audio out: TS4990 BTL amp powered from the battery rail, gain ~1.5×, with a 2-pole RC low-pass (~6–10 kHz) on its input. STBY is on `AMP_EN`, and R9 (100k pull-down) keeps the amp off until firmware drives it high. The volume knob is read on an ADC pin and applied as digital gain in the DSP.
+- RTC: internal. Y1 (32.768 kHz) is DNP on the current build, so the RTC runs from HSE/32 and loses time at power-off. VBAT comes from the always-on LDO output through R29 (1 kΩ). On the MCU sheet that net is labelled "VBUS", but it is not USB 5 V.
+- Indicator LEDs: 680 Ω, ~2 mA. Design for 1–3 mA, not 20 mA.
+
+| Pin | Function | Pin | Function |
+|---|---|---|---|
+| PA0 | ADC1_IN1 mic (`ADC_INPUT`) | PB0 | PSRAM CS (100k pull-up) |
+| PA1 | ADC2_IN2 LO pot (RV1) | PB2 | SD CS |
+| PA2 | `RECORD_BUTTON`, active low, internal pull-up | PB3/4/5 | SPI1 SCK/MISO/MOSI |
+| PA3 | `PLAYBACK_BUTTON`, active low, internal pull-up | PB6 / PB7 | LED1 / LED0 |
+| PA4 | DAC1_OUT1 → amp | PB8 | BOOT0 (10k pull-down) |
+| PA5 | ADC2_IN13 volume (VR1) | PB10 | `AMP_EN` |
+| PA6 | ADC2_IN3 V_BAT/2 (1M/1M + 100n, 500 kΩ source) | PB11 / PB12 | `DISPLAY_RESET` / `DISPLAY_DC` |
+| PA8 | Display CS | PB13/14/15 | SPI2 SCK/MISO/MOSI |
+| PA9 | Display backlight | PF0/PF1 | 16 MHz HSE |
+| PA11/12 | USB D−/D+ | PA13/14 | SWD |
+
+Unused: PA7, PA10, PA15, PB1, PB9, PC13.
+
+## Firmware state (as of Sep–Oct 2026; check against the code)
+
+- ADC→DAC DMA passthrough, timer-triggered, ping-pong buffering.
+- `fft.c`: 1024 real samples packed into a 512-point complex FFT, Hann window, unpacked with the half-length real-FFT identity. Outputs 513 unnormalised linear-magnitude bins in `fftMagnitude[]`.
+- `waterfall.c/.h`: built on the afiskon ILI9341 driver with VSCRDEF/VSCRSADD hardware scroll patched into the driver. Portrait native orientation, peak-hold accumulator (so short calls aren't lost between rows), thermal palette, bins 0–1 excluded, ticks every 20 kHz, LO frequency readout at the top. dB conversion happens here. `Waterfall_SetRange` was calibrated from measured dB values.
+- `dsp.c`: digital heterodyne (NCO → multiply → decimate → DAC). Currently effectively zero-IF / direct conversion.
+- Sample rate: TIM2 ARR 884 gives 170 MHz / 885 = 192,090.4 Hz. Two constants disagree with this: `SAMPLE_RATE` (dsp.h, 192060) and `WF_SAMPLE_RATE_HZ` (waterfall.h, 192000).
+- V2 port: the .ioc is regenerated for V2 pins and the firmware builds. Still to do:
+  - Remove TIM3 and `tim3_lo.c`.
+  - Set up the ADC2 3-rank scan (IN2 / IN13 / IN3).
+  - Delete `ili9341_touch.*`. It is V1-only and hardcodes `hspi1`, PB4 and PA10, which are now the PSRAM bus.
+  - Recalibrate `DSP_GAIN` and `Waterfall_SetRange` for the 140× front end.
+  - Drop the LO offset in `waterfall.c` `BinToDisplayFreq`. The FFT is of the raw ADC, so the axis is absolute; it only reads correctly today because `Waterfall_SetLOFrequency(0)` is the only call.
+
+Bugs already fixed — do not reintroduce:
+- FFT unpack twiddle sign is `+2πk/N`.
+- `DSP_Mixer` LUT index must be `phase >> 23` for the 512-entry (2^9) sine table. `>> 24` only addresses half the table and gives a near-DC oscillator, which caused speaker-to-mic acoustic feedback.
+
+## Hard-won gotchas
+
+- DMA start order: `DAC_Start()` → `ADC_Start()` → `HAL_TIM_Base_Start()`. Reversing it underruns on the first TRGO. (main.c currently starts TIM2 first; reconcile.)
+- On the G4 the DAC underrun IRQ shares the `TIM6_DAC` vector. There is no `DAC1_IRQn`; enable it via CubeMX's combined TIM6/DAC interrupt option.
+- SPI2 is shared by the display (CS PA8) and the SD card (CS PB2). `MX_GPIO_Init` leaves every CS low unless the pin's output level is set High in CubeMX, so deselect both before any SPI2 traffic. Keep all SPI2 users in main-loop context so they serialise.
+- SD init needs ≤400 kHz. With APB1 at 170 MHz, SPI2's slowest clock (/256) is 664 kHz, so APB1 must be /2. APB timer clocks double when the prescaler isn't 1, so TIM2/TIM3 still run at 170 MHz.
+- CubeMX's default SPI data size on G4 is 4 bits. Always set 8 bits explicitly.
+- CubeMX generates SPI pins at `GPIO_SPEED_FREQ_LOW`. Use High / Very High for anything above ~20 MHz (PSRAM at 42.5 MHz).
+- If LSE is enabled with Y1 not fitted, `SystemClock_Config` times out and `Error_Handler` hangs with IRQs off. The board looks dead.
+- The RTC prescalers must match its clock source: (Asynch+1)(Synch+1) = f_RTC. CubeMX's 127/255 default is for 32.768 kHz; HSE/32 = 500 kHz needs 124/3999.
+
+## Next up
+
+- V2 order:
+  1. V1 features running on V2.
+  2. PSRAM bring-up: reset `0x66`/`0x99`, read ID `0x9F` (expect `0x0D`/`0x5D`), then pattern-test all 8 MB.
+  3. PSRAM pre-trigger ring buffer + SD recording.
+  4. Time-expansion playback from PSRAM on PLAYBACK.
+- Free RAM before recording (~8 KB reclaimable):
+  - `windowCoeff` / twiddles / `sineTable`: 7 KB, can be const tables in flash.
+  - `dacQueue`: 1 KB, goes away with the DAC fix below.
+  - Raise the stack to 2 KB for FatFS.
+- Recording architecture: SD writes can stall 100–250 ms (up to ~96 KB at 384 kB/s), so PSRAM writes must be driven from the ADC ISR side. One ISR-driven SPI1 engine owns the PSRAM; the SD writer and the playback prefetch queue read requests to it.
+- DAC double-buffering fix: `DAC_WriteBlock` must write to the correct circular-buffer half.
+- Finish the DSP chain: bandpass around the 1–2 kHz output, float throughout to avoid inter-stage truncation, and wire in the notch filter. It is initialised in `DSP_Init` but not connected in `DSP_ProcessBlock`, and `dsp_filters.h` hasn't been reviewed yet.
+- Time-expansion mode: capture a detected call from PSRAM and play it back slowed down. The record button writes the PSRAM pre-trigger data to SD, followed by the live stream.
+- WAV header formatting compatible with bat-ID software.
+- Battery voltage sensing via ADC divider.
+- Gain range switching or AGC.
+
+## Open decisions
+
+- Sample rate: decide before writing the WAV writer.
+  - 192.09 kHz: Nyquist 96 kHz, below the 100 kHz target.
+  - 250 kHz exactly (TIM2 ARR 679): an integer WAV rate and Nyquist 125 kHz. It costs 680 vs 885 cycles/sample, 500 vs 384 kB/s to PSRAM/SD, and 16.8 vs 21.8 s of PSRAM history.
+- Fit Y1, which is needed for an RTC that survives power-off (WAV timestamps).
+- GPS: in or out of v2 scope (it would fix RTC drift across power gaps).
+- MEMS mic response shaping at the top of the band vs flat boost.
+- Deferred from v2: USB audio (384 kHz USB mic).
