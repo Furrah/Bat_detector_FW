@@ -378,16 +378,121 @@ Entries are in order, with the newest at the bottom. Decisions that are agreed b
 - **Open question:** Is the 24.95 kHz line on the board (the display's ~25.6 kHz nominal line rate fits) or in the room? A display-unplugged or outdoor energy capture would settle it.
 - **Lesson:** Find out where noise comes from before changing thresholds. Indoors is a poor proxy for the field: rooms are full of ultrasonic sources.
 
+### 34. The PSRAM ring: DMA bursts, one interrupt at the top (Oct 30)
+- **Decision:** Record every raw ADC block into the PSRAM continuously, with an engine driven by DMA and interrupts (`Core/Drivers/psram_ring.c`). The last 16.8 s are always available for recording and time expansion (plan P2).
+- **How it works:**
+  - **Bursts:** each 512-byte block is written as 16 bursts of 32 bytes. One burst is one CE# cycle, moved entirely by DMA2: TX from a staging buffer, RX draining every byte.
+  - **Burst-complete interrupt:** the RX transfer-complete interrupt raises CE# first, then starts the next burst.
+  - **Reads:** queued (4 deep) and run between writes; writes always go first.
+- **Why these numbers:**
+  - **Burst size:** a write burst is 36 bytes, which takes 6.8 µs at 42.5 MHz; a fast-read burst is 37 bytes, 7.0 µs. With the interrupt raising CE#, it's low for about 7.2 µs against tCEM = 8 µs. The margin is small, so CE# is timed on every burst (`psramRingMaxSelectNs`). If it ever exceeds 7.5 µs, 16-byte bursts (~4 µs) are a one-line change.
+  - **No copy of the audio:** the bursts read straight from the ADC buffer half the DSP has just been given. The ADC is filling the other half, so the writes have 1.024 ms and need about 130 µs.
+  - **Loads:** about 12% of SPI1's time and an estimated 2% of the CPU. RAM +0.3 KB, flash +2.1 KB.
+- **The priority rule:** The burst-complete interrupt (DMA2 Channel 1) must be the only one at priority 0. The DSP interrupt runs for about 370 µs per block. If it, or USB, could delay the burst interrupt, CE# would stay low about 50× too long. The PSRAM can't refresh while selected, and at room temperature a data test can still pass (entry 12). `PsramRing_Start()` checks every enabled interrupt. If the priorities are wrong, it refuses to start and the boot screen shows "Ring: NVIC prio", while the rest of the board runs normally.
+- **Fault handling:**
+  - **Stuck burst:** a burst still in flight when the next block arrives (at least 1 ms against ~8 µs expected) resets SPI1 through RCC, fails any queued reads and counts a fault.
+  - **Late block:** a block that hasn't finished writing when the next arrives is counted in `psramRingLateBlocks`.
+- **Proof, end to end:** The debug link's `M` command reads the last raw snapshot's blocks back from the ring. `capture.py verify` checks them bit for bit against the snapshot, so the check covers the whole chain: ADC, write, PSRAM, read and USB.
+- **Alternatives considered:**
+  - **Polled writes from the audio interrupt with interrupts masked:** about 110 µs of CPU per block (11%), with everything else held off 7 µs at a time.
+  - **CE# driven by a timer output on PB0:** bounds CE# in hardware whatever the interrupt latency, but is more complex. It's the fallback if the priority rule ever can't hold.
+  - **Copying each block into an SRAM FIFO first:** 1 KB+ of RAM for a deadline that already has an 8× margin.
+- **Outcome:** Works on hardware, after one fix (entry 35).
+  - **Priorities:** set in CubeMX as required: DMA2 Ch1 alone at 0; DMA1 Ch1/Ch2, TIM6_DAC, USB and DMA2 Ch2 at 1; DMA1 Ch3 at 3.
+  - **Data:** `capture.py verify --count 50` passed: 400 KB read back bit-identical, including across the ring's wrap. Four snapshots read back after being held for 15.6 s also matched. Late blocks 0, faults 0.
+  - **CE# time: out of spec at first.** Every burst held CE# low for 9.1 µs against the 8 µs limit, while the data test passed. That's entry 12's warning come true: a data test at room temperature can't see a refresh violation. The cause was a CubeMX default that put 2 idle clocks after every byte (entry 35). With it off, write bursts measure 7.41–7.52 µs and none of 8.5 million exceed tCEM. Read bursts (one byte longer, expected ~7.7 µs) are still to be measured under `verify`.
+  - **CPU cost: the estimate was wrong.** The DSP's measured worst-case load rose from 37% to 43–45%, not by 2%. Each burst interrupt takes 3.9–4.1 µs, and 16 per block come to about 65 µs of every 1.024 ms (6%). That's about 670 CPU cycles for a short handler. The suspects are flash wait states (4 at 170 MHz, prefetch off, the handler evicted from the 1 KB instruction cache by the DSP between bursts) and newlib-nano's byte-at-a-time `memcpy`. Not yet investigated.
+  - **Diagnostics kept:** `psramRingMinSelectNs`, `psramRingMaxEntryNs` (CE# low to interrupt start), `psramRingMaxIsrNs` (CPU time per burst), `psramRingOverTcem`, `psramRingBursts`, and `psramRingResetStats` (write 1 to restart them).
+- **Lesson:** When a hardware timing limit depends on interrupt latency, make the latency a checked precondition rather than an assumption, and measure the limit on every cycle. Measuring it is what caught the problem: the data test passed regardless.
+
+### 35. SPI "NSS pulse mode": two idle clocks after every byte (Oct 30)
+- **Decision:** Turn off NSS pulse mode (NSSP) on SPI1 and SPI2 in CubeMX. `PsramRing_Start()` now refuses to run if it's ever on again (boot screen: "Ring: SPI1 config").
+- **Context:** The PSRAM ring (entry 34) passed its data test, but every burst held CE# low for 9.1 µs, over the PSRAM's 8 µs tCEM. The design had predicted about 7.2 µs.
+- **What NSSP is:**
+  - In ordinary (Motorola-format) SPI, the master pulls the chip select low, clocks any number of bytes, and releases it at the end of the transaction. Each byte, or frame, follows the last with no gap.
+  - Some devices need the chip select to go high between *every* frame, because they latch each word on the rising edge of CS. Many SPI ADCs and DACs work like this. For them, STM32's SPI has NSS pulse mode. When it's on, the SPI hardware raises its own NSS pin for at least one clock period between consecutive frames, so firmware doesn't have to toggle a pin for every word.
+  - To fit that pulse in, the SPI stops SCK between frames. It only applies to a master using CPHA = 0 (data captured on the first clock edge), which is the most common SPI mode and the one the PSRAM, display and SD card use.
+  - The pause comes from the SPI's own sequencer, so it happens even when nothing uses the NSS pin. This board drives every chip select from a GPIO ("software NSS"), so the pulse went nowhere, but every byte still paid for it.
+  - On the STM32G4 it's the NSSP bit (bit 3) of `SPIx_CR2`. CubeMX shows it as "NSSP Mode" under the SPI's parameter settings, and its default for the G4 is Enabled.
+- **How it was found (with numbers):**
+  - **Split the time before guessing the cause.** A diagnostic build cut each burst's CE# low time into two parts, using the cycle counter: CE# low to the start of the interrupt (the transfer plus interrupt latency), and the start of the interrupt to CE# high. It also recorded the shortest burst, and counted the bursts over tCEM.
+  - **Results:** shortest 9.07 µs, longest 9.18 µs, and all 8,563,216 bursts over tCEM. CE# low to interrupt start: 8.94 µs. Inside the interrupt: about 0.24 µs.
+  - **What that ruled out:** with only 112 ns between the shortest and longest burst, the cause wasn't occasional interrupt latency. With 0.24 µs in the interrupt, it wasn't the handler. The transfer itself was taking 2 µs longer than it should.
+  - **The clock was right:** 16 MHz crystal ÷4 × 85 ÷2 = 170 MHz, APB2 ÷1, SPI ÷4 = 42.5 MHz.
+  - **So the bytes had gaps between them,** and the generated `MX_SPI1_Init()` had `NSSPMode = SPI_NSS_PULSE_ENABLE`.
+  - **After turning it off:** 7.41–7.52 µs, and none of 8.5 million bursts over tCEM. The difference, (9070 − 7405) ns over 35 byte boundaries, is 47.6 ns per byte: 2.0 periods of the 42.5 MHz clock. So each byte took 10 clocks instead of 8, and the SPI lost 20% of its throughput.
+  - **Where the 7.5 µs goes now:** 6.78 µs on the wire (36 bytes × 8 bits at 42.5 MHz); about 0.5 µs for the DMA to start, drain the last byte and raise the interrupt; and about 0.24 µs inside the interrupt before CE# goes high. That leaves 0.48 µs of margin.
+- **Alternatives considered:**
+  - **16-byte bursts:** would have got under 8 µs even with the gaps (about 5.4 µs), but at twice the interrupts per block, and with the 20% throughput loss still there.
+  - **Raising CE# sooner, or running the handler from zero-wait-state CCM RAM:** could save at most the 0.24 µs measured inside the interrupt; the extra time wasn't there.
+  - **An oscilloscope on CE# and SCK:** would have shown the gaps directly. Splitting the time with the cycle counter pointed to them without one.
+- **Outcome:** Write bursts were within tCEM with 0.48 µs to spare. Reads, a byte longer, reached 8.12 µs under `verify`, with 3 bursts over, which led to 16-byte bursts (entry 36). SPI2 (display and SD card) no longer pays the same 20% overhead; its speed-up isn't measured yet.
+- **Lesson for future designs:**
+  - When a measured time disagrees with the calculation, split it into parts and measure each one before choosing a fix. The obvious fixes here (a faster handler, smaller bursts) would have treated the wrong part.
+  - Read every field the code generator writes for a peripheral, not just the ones you set. A default can be meant for a different kind of device.
+
+### 36. 16-byte bursts, and the burst interrupt moved to RAM (Oct 30)
+- **Decision:**
+  - Write and read the PSRAM in 16-byte bursts instead of 32.
+  - Run the burst interrupt's code from RAM, and compile `psram_ring.c` at `-O2` with a `#pragma` in the file. The rest of the Debug build stays at `-Og`.
+  - Skip HAL's DMA handler after ours, with a `return` in the USER CODE block of `DMA2_Channel1_IRQHandler`.
+- **Context:** With NSSP off (entry 35), write bursts took 7.4–7.5 µs. `capture.py verify` makes the ring read back 16 blocks per snapshot. During verify, the longest burst reached 8.12 µs, and 3 of about 12,800 read bursts went over tCEM.
+- **Why reads went over (with numbers):**
+  - A read burst is one byte longer than a write, because the fast-read command needs a wait byte. That makes it about 7.6–7.7 µs.
+  - The extra ~0.45 µs (about 75 CPU cycles) came from code that masks all interrupts with `__disable_irq()`, which blocks even the priority-0 burst interrupt. Two such sections run during verify:
+    - `PsramRing_ReadBlock()`, called on every main-loop pass while the read queue is full.
+    - `PsramRing_PushBlock()`. In normal running it never overlaps a burst, but it can land in the middle of a read.
+  - The SD writer and time expansion will read the PSRAM constantly, so this had to be fixed, not avoided.
+- **Why 16-byte bursts:**
+  - Time on the wire drops to 3.76 µs for a write (20 bytes) and 3.95 µs for a read (21 bytes). That leaves about 3 µs to absorb delays, roughly 10× the delay seen.
+  - **Alternative: keep 32 bytes and never mask the burst interrupt.** Replace `__disable_irq()` with BASEPRI, which masks everything except priority 0, and make the read queue lock-free. That fixes today's cause, but leaves 0.3 µs of margin that every future critical section anywhere in the firmware would have to respect.
+  - **Alternative: end CE# with a timer output on PB0.** That's immune to latency, but a large change.
+- **The cost turned out to be large.** Halving the burst size doubles the interrupts per block. The first 16-byte build peaked at 110% DSP load during verify: a block overran its 1.024 ms deadline.
+  - Each burst interrupt took 4.04 µs (measured). Add HAL's DMA handler after it, plus interrupt entry and exit: about 4.7 µs of CPU for a burst that lasts 4.5 µs.
+  - With reads running back to back, the interrupt took over half the CPU, and the DSP's ~380 µs of work per block stretched past the deadline.
+  - 32-byte bursts had the same problem, only milder. In normal running, writes alone cost an affordable +6%. Only the back-to-back reads exposed it.
+- **Why the interrupt was so slow:**
+  - **Not the copy.** I had suspected the 16-byte `memcpy`, assuming newlib-nano copies a byte at a time. The disassembly showed GCC inlines it.
+  - **Size, and where it ran from.** The interrupt path was about 1 KB of `-Og` code: handler 340 B, burst start 284 B, timing 204 B, DMA stop 80 B. Between bursts, the DSP pushes it out of the flash's 1 KB instruction cache. So every burst ran it cold from flash, with 4 wait states at 170 MHz and prefetch off.
+- **Fixes, one at a time,** measured with `psramRingMaxIsrNs` and `dspLoadMaxPercent`:
+
+  | Build | Interrupt (max) | DSP load, ring writing | DSP load, during verify | CE# max |
+  |---|---|---|---|---|
+  | Handler in flash, `-Og` | 4.04 µs | not measured | 110% | 5.04 µs |
+  | In RAM, `-Og`, HAL handler skipped | 3.05 µs | 46% | 70% | 5.11 µs |
+  | In RAM, `-O2` | 2.32–2.48 µs | 45% | 66% | 4.44 µs |
+
+  - **Why RAM alone saved only 25%.** The Cortex-M4 fetches code from ordinary RAM (at 0x2000_0000) over its system bus. The code's own loads and stores use the same bus, so the two take turns, at about 2 cycles per instruction. `-Og` made this worse: it doesn't inline the small helper functions, so every call pushes and pops registers on the stack in that same RAM.
+  - **What `-O2` changed.** It inlined the helpers into the handler and kept values in registers.
+- **Costs:**
+  - **RAM:** 1.0 KB for the interrupt code, copied from flash at boot. Free RAM went from 3.8 KB to 2.9 KB.
+  - **A linker warning:** "LOAD segment with RWX permissions", because RAM that holds code is both writable and executable. Expected and harmless here.
+  - **Debugging:** at `-O2`, `psram_ring.c` is harder to step through, because variables are optimised out.
+- **Alternatives considered for the CPU cost:**
+  - **CCM SRAM at 0x1000_0000.** The G431's 10 KB of core-coupled RAM is fetched over the instruction bus, separately from data, so code runs there without contention. It needs a linker-script change to carve its alias (from 0x2000_5800 up) out of the normal RAM region. This is the next step if the CPU cost matters later.
+  - **Flash prefetch** (off in CubeMX). It would speed up all flash code, the DSP included. It's a separate experiment, because it changes the whole system's timing.
+  - **Pacing reads.** Limiting read bursts per block would stop a reader from taking the CPU in bursts. That decision belongs to the SD writer's design.
+- **Outcome:**
+  - **CE#:** at most 4.44 µs with reads running, which is 3.56 µs inside tCEM. No bursts over.
+  - **DSP load:** 45% while the ring writes (37% without the ring) and 66% in the worst case, with reads running back to back.
+  - **Data:** no late blocks or faults, and `verify` read back 400 KB identical.
+  - **Net cost:** at 2.3 µs and 32 bursts per block, writing the ring costs about 7% of the CPU.
+- **Lessons for future designs:**
+  - Measure an interrupt's cost under the heaviest load it will see, not only in normal running. +6% in normal running became an overrun once reads ran back to back.
+  - Before making an interrupt run more often, measure what one costs.
+  - On a Cortex-M4, running code from RAM isn't automatically fast. Ordinary SRAM shares the system bus between code and data; use the core-coupled RAM for hot code if the part has it.
+  - Check the disassembly before blaming a function. The suspected `memcpy` wasn't even called.
+
 ---
 
 ## Planned decisions (agreed, not built yet)
 
 ### P1. Reclaim about 8 KB of RAM: built, see entries 26–29.
 
-### P2. PSRAM as the recording buffer, written from the interrupt side (planned)
+### P2. PSRAM as the recording buffer, written from the interrupt side (ring built, entry 34; SD writer planned)
 - **Plan:** PSRAM writes must never wait on the main loop, which may be stuck inside an SD write. So one interrupt-driven, DMA-driven SPI1 engine owns the PSRAM.
   - It uses DMA2, away from the audio channels on DMA1.
-  - Bursts are 32 bytes at most, which is about 7 µs at wire speed.
+  - Bursts are 32 bytes at most, which is about 7 µs at wire speed. (Built with 16-byte bursts for margin; entry 36.)
   - The SD writer and playback send read requests to it.
 - **Why:** SD cards can stall for 100–250 ms while erasing. At 500 kB/s that's up to 125 KB of audio, far more than the RAM. The PSRAM absorbs it.
 
@@ -436,7 +541,7 @@ Entries are in order, with the newest at the bottom. Decisions that are agreed b
 - Bring up one unknown at a time (entry 1).
 - Prefer names and checks that turn mistakes into compile errors (entries 2, 17).
 - Every wait loop gets a timeout (entries 14, 21).
-- Measure timing with the cycle counter, and don't trust a test that can pass while out of spec (entries 11, 12, 19).
+- Measure timing with the cycle counter, and don't trust a test that can pass while out of spec (entries 11, 12, 19, 34).
 - Keep one source of truth for rates and sizes, checked by the compiler (entry 17).
 - Measure real-time margins at the optimisation level you run, and mark shared variables `volatile` (entry 20).
 - Set the GPIO speed of fast pins (entry 14).
@@ -446,6 +551,12 @@ Entries are in order, with the newest at the bottom. Decisions that are agreed b
 - Run new control logic in "monitor only" mode before it drives hardware (entry 30).
 - Check CubeMX's generated values against the HAL's own defaults for the family; read the USB line state before blaming the clock (entry 31).
 - Build the measurement path before tuning, and have the analysis check itself against the device (entry 32).
+- When a timing limit depends on interrupt latency, check the priorities at start-up and measure the limit on every cycle (entry 34).
+- When a measured time disagrees with the calculation, split it into parts and measure each before choosing a fix (entry 35).
+- Read every setting CubeMX generates for a peripheral, not just the ones you changed. Its G4 SPI default (NSS pulse mode) costs 20% of the bus speed (entry 35).
+- Measure an interrupt's CPU cost under its heaviest load before making it run more often (entry 36).
+- On a Cortex-M4, put hot code in core-coupled RAM if the part has it: ordinary SRAM shares the bus between code and data (entry 36).
+- Check the disassembly before blaming a function (entry 36).
 
 ---
 

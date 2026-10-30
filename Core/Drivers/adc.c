@@ -9,6 +9,7 @@
 #include "adc.h"
 
 #include "main.h"
+#include "psram_ring.h"
 
 
 extern ADC_HandleTypeDef hadc1;
@@ -122,6 +123,9 @@ void HAL_ADC_ConvHalfCpltCallback(
     {
 //    	HAL_GPIO_TogglePin(GPIOB,LED1_Pin);
 
+        // raw block into the PSRAM ring, before the DSP runs
+        PsramRing_PushBlock(&adcBuffer[0]);
+
         if(halfCallback != 0)
         {
             ADC_RunBlockCallback(halfCallback, &adcBuffer[0]);
@@ -138,6 +142,8 @@ void HAL_ADC_ConvCpltCallback(
 
         adcConversionCount++;
 //    	HAL_GPIO_TogglePin(GPIOB,LED1_Pin);
+
+        PsramRing_PushBlock(&adcBuffer[AUDIO_BLOCK_SIZE]);
 
         if(fullCallback != 0)
         {

@@ -17,6 +17,9 @@
  *        arg0 = block number of the first sample, arg1 = sample rate
  *   'E'  payload: arg1 x DebugEnergyRecord_t
  *        arg0 = records dropped so far because the PC fell behind
+ *   'M'  payload: the last snapshot's blocks as read back from the PSRAM
+ *        ring, arg0 = ring block number of the first, arg1 = sample rate.
+ *        Empty, with arg0 = 0xFFFFFFFF, if they can't be read.
  *
  * One 8 KB buffer holds either the snapshot or the energy FIFO, so a
  * snapshot request stops the energy stream.
@@ -41,6 +44,7 @@
 #include "pipeline_config.h"
 #include "usbd_cdc_if.h"
 #include "../DSP/bat_detect.h"
+#include "../Drivers/psram_ring.h"
 
 
 /* Raw snapshot: 16 blocks = 4096 samples = 16.4 ms at 250 kHz */
@@ -53,6 +57,9 @@
 
 #define DEBUG_PROTOCOL_VERSION      1U
 #define DEBUG_COMMAND_QUEUE         16U
+
+/* 'M' frame when the snapshot can't be read back */
+#define DEBUG_READBACK_FAILED       0xFFFFFFFFU
 
 /* 12-bit ADC mid-scale, as in DSP_ProcessBlock */
 #define ADC_MIDSCALE                2048
@@ -114,7 +121,8 @@ typedef enum
     DEBUG_MODE_IDLE = 0,
     DEBUG_MODE_SNAPSHOT,        /* the interrupt is filling the snapshot */
     DEBUG_MODE_SNAPSHOT_READY,  /* full; the main loop sends it */
-    DEBUG_MODE_ENERGY           /* the interrupt adds an energy record per block */
+    DEBUG_MODE_ENERGY,          /* the interrupt adds an energy record per block */
+    DEBUG_MODE_READBACK         /* the PSRAM ring is reading the snapshot back */
 } DebugMode_t;
 
 typedef enum
@@ -135,6 +143,8 @@ static volatile uint8_t  mode = DEBUG_MODE_IDLE;
 static volatile uint32_t blockCount = 0;
 static volatile uint32_t snapshotBlocks = 0;
 static volatile uint32_t snapshotStartBlock = 0;
+static volatile uint32_t snapshotRingBlock = 0;     /* PSRAM ring number of its first block */
+static volatile uint8_t  snapshotInRing = 0;
 static volatile uint32_t energyWrite = 0;       /* the interrupt adds records here */
 static volatile uint32_t energyRead = 0;        /* the main loop sends from here */
 static volatile uint32_t energyDropped = 0;
@@ -153,6 +163,8 @@ static uint8_t txCrcBytes[4];
 static uint8_t txStage = TX_IDLE;
 static uint16_t txSequence = 0;
 static uint32_t txRecords = 0;                  /* energy records in the frame being sent */
+static uint32_t readbackNext = 0;               /* next snapshot block to ask the ring for */
+static volatile uint8_t readbackDone[DEBUG_SNAPSHOT_BLOCKS];
 
 
 
@@ -221,6 +233,10 @@ void DebugLink_AddBlock(const uint16_t *input, uint32_t length, float energy)
         if(filled == 0U)
         {
             snapshotStartBlock = block;
+
+            /* the ring took this block just before the DSP ran */
+            snapshotRingBlock = PsramRing_GetPushedBlocks() - 1U;
+            snapshotInRing = PsramRing_IsRunning();
         }
 
         memcpy(&captureBuffer.samples[filled * AUDIO_BLOCK_SIZE], input,
@@ -310,7 +326,7 @@ static uint8_t DebugLink_Send(const void *data, uint32_t length)
 /* The frame's payload has been sent, so release its part of the buffer */
 static void DebugLink_FrameSent(void)
 {
-    if(txHeader.type == 'R')
+    if((txHeader.type == 'R') || ((txHeader.type == 'M') && (mode == DEBUG_MODE_READBACK)))
     {
         mode = DEBUG_MODE_IDLE;
     }
@@ -399,6 +415,50 @@ static void DebugLink_StartEnergyFrame(void)
 }
 
 
+/*
+ * Ask the ring for the snapshot's blocks as its queue allows, then send
+ * them once all have arrived. Nothing else uses the buffer meanwhile.
+ */
+static void DebugLink_ContinueReadback(void)
+{
+    while(readbackNext < DEBUG_SNAPSHOT_BLOCKS)
+    {
+        const PsramRing_ReadResult_t result = PsramRing_ReadBlock(snapshotRingBlock + readbackNext,
+                &captureBuffer.samples[readbackNext * AUDIO_BLOCK_SIZE], &readbackDone[readbackNext]);
+
+        if(result == PSRAM_RING_READ_BUSY)
+        {
+            return;     /* queue full: carry on next time */
+        }
+
+        if(result == PSRAM_RING_READ_INVALID)
+        {
+            DebugLink_StartFrame('M', NULL, 0U, DEBUG_READBACK_FAILED, 0U);
+            return;
+        }
+
+        readbackNext++;
+    }
+
+    for(uint32_t i = 0; i < DEBUG_SNAPSHOT_BLOCKS; i++)
+    {
+        if(readbackDone[i] == PSRAM_RING_PENDING)
+        {
+            return;
+        }
+
+        if(readbackDone[i] == PSRAM_RING_FAILED)
+        {
+            DebugLink_StartFrame('M', NULL, 0U, DEBUG_READBACK_FAILED, 0U);
+            return;
+        }
+    }
+
+    DebugLink_StartFrame('M', captureBuffer.samples, sizeof(captureBuffer.samples),
+            snapshotRingBlock, AUDIO_SAMPLE_RATE_HZ);
+}
+
+
 static void DebugLink_HandleCommand(uint8_t command)
 {
     uint32_t primask;
@@ -440,6 +500,19 @@ static void DebugLink_HandleCommand(uint8_t command)
 
     case 'S':
         mode = DEBUG_MODE_IDLE;
+        break;
+
+    case 'M':
+        /* reuses the buffer, so it stops an energy stream like 'R' does */
+        if(snapshotInRing && ((mode == DEBUG_MODE_IDLE) || (mode == DEBUG_MODE_ENERGY)))
+        {
+            readbackNext = 0U;
+            mode = DEBUG_MODE_READBACK;
+        }
+        else
+        {
+            DebugLink_StartFrame('M', NULL, 0U, DEBUG_READBACK_FAILED, 0U);
+        }
         break;
 
     default:
@@ -485,6 +558,10 @@ void DebugLink_Poll(void)
             else if(mode == DEBUG_MODE_ENERGY)
             {
                 DebugLink_StartEnergyFrame();
+            }
+            else if(mode == DEBUG_MODE_READBACK)
+            {
+                DebugLink_ContinueReadback();
             }
         }
     }

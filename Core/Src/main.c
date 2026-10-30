@@ -33,6 +33,7 @@
 #include "debug_link.h"
 #include "dac.h"
 #include "psram.h"
+#include "psram_ring.h"
 #include "sd_spi.h"
 #include "tim3_lo.h"
 #include "fft.h"
@@ -134,7 +135,7 @@ static void MX_RTC_Init(void);
  * The full 8 MB pattern test runs only if RECORD is held at power-up,
  * because the polled -O0 driver takes ~35 s for it.
  */
-static void PSRAM_BootCheck(void)
+static PSRAM_Status_t PSRAM_BootCheck(void)
 {
     char text[24];
     uint8_t mfid;
@@ -190,6 +191,8 @@ static void PSRAM_BootCheck(void)
             (selectNs > PSRAM_TCEM_NS) ? ILI9341_RED : ILI9341_WHITE, ILI9341_BLACK);
 
     HAL_Delay((status == PSRAM_OK) ? 1500U : 5000U);
+
+    return status;
 }
 
 
@@ -433,7 +436,19 @@ int main(void)
 
   // Hold RECORD at power-up for the full 8 MB test. Waterfall_Init clears
   // the result off the screen afterwards.
-  PSRAM_BootCheck();
+  if(PSRAM_BootCheck() == PSRAM_OK)
+  {
+      // From here SPI1 belongs to the ring, which keeps the last 16.8 s of
+      // raw audio. Started before the ADC, so ring block 0 is the first block.
+      PsramRing_Status_t ringStatus = PsramRing_Start();
+
+      if(ringStatus != PSRAM_RING_OK)
+      {
+          ILI9341_WriteString(5, 140, (ringStatus == PSRAM_RING_ERR_PRIORITY) ? "Ring: NVIC prio" : "Ring: SPI1 config",
+                  Font_11x18, ILI9341_RED, ILI9341_BLACK);
+          HAL_Delay(5000);
+      }
+  }
 
   // Hold PLAYBACK at power-up for the SD write/read speed test
   SD_BootCheck();
@@ -927,7 +942,7 @@ static void MX_SPI1_Init(void)
   hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
   hspi1.Init.CRCPolynomial = 7;
   hspi1.Init.CRCLength = SPI_CRC_LENGTH_DATASIZE;
-  hspi1.Init.NSSPMode = SPI_NSS_PULSE_ENABLE;
+  hspi1.Init.NSSPMode = SPI_NSS_PULSE_DISABLE;
   if (HAL_SPI_Init(&hspi1) != HAL_OK)
   {
     Error_Handler();
@@ -967,7 +982,7 @@ static void MX_SPI2_Init(void)
   hspi2.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
   hspi2.Init.CRCPolynomial = 7;
   hspi2.Init.CRCLength = SPI_CRC_LENGTH_DATASIZE;
-  hspi2.Init.NSSPMode = SPI_NSS_PULSE_ENABLE;
+  hspi2.Init.NSSPMode = SPI_NSS_PULSE_DISABLE;
   if (HAL_SPI_Init(&hspi2) != HAL_OK)
   {
     Error_Handler();
@@ -1088,10 +1103,10 @@ static void MX_DMA_Init(void)
 
   /* DMA interrupt init */
   /* DMA1_Channel1_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA1_Channel1_IRQn, 0, 0);
+  HAL_NVIC_SetPriority(DMA1_Channel1_IRQn, 1, 0);
   HAL_NVIC_EnableIRQ(DMA1_Channel1_IRQn);
   /* DMA1_Channel2_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA1_Channel2_IRQn, 0, 0);
+  HAL_NVIC_SetPriority(DMA1_Channel2_IRQn, 1, 0);
   HAL_NVIC_EnableIRQ(DMA1_Channel2_IRQn);
   /* DMA1_Channel3_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(DMA1_Channel3_IRQn, 3, 0);
@@ -1100,7 +1115,7 @@ static void MX_DMA_Init(void)
   HAL_NVIC_SetPriority(DMA2_Channel1_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(DMA2_Channel1_IRQn);
   /* DMA2_Channel2_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA2_Channel2_IRQn, 0, 0);
+  HAL_NVIC_SetPriority(DMA2_Channel2_IRQn, 1, 0);
   HAL_NVIC_EnableIRQ(DMA2_Channel2_IRQn);
 
 }

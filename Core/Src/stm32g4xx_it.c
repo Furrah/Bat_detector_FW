@@ -22,6 +22,7 @@
 #include "stm32g4xx_it.h"
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "../Drivers/psram_ring.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -281,6 +282,12 @@ void TIM6_DAC_IRQHandler(void)
 void DMA2_Channel1_IRQHandler(void)
 {
   /* USER CODE BEGIN DMA2_Channel1_IRQn 0 */
+
+  // PSRAM ring burst finished: raises CE# and starts the next burst. It
+  // clears the flags, so the HAL handler below would find nothing to do:
+  // skip it, it runs ~30 instructions from flash on every burst.
+  PsramRing_IRQHandler();
+  return;
 
   /* USER CODE END DMA2_Channel1_IRQn 0 */
   HAL_DMA_IRQHandler(&hdma_spi1_rx);

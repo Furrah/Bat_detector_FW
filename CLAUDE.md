@@ -16,8 +16,10 @@ Handheld, battery-powered ultrasonic bat detector covering the 20–120 kHz echo
 
 - CubeMX-generated files: only edit inside `/* USER CODE BEGIN */ … /* USER CODE END */` blocks. Anything outside is wiped when the .ioc is regenerated.
 - Make incremental, targeted changes scoped to the function or module in question, with the rationale stated. No whole-file rewrites.
-- RAM: 4.3 KB free with the USB debug capture built in (28.4 KB used, including a 2 KB stack and 0.5 KB heap reservation). `DEBUG_CAPTURE 0` in `debug_link.h` frees its 8 KB buffer. No malloc, no large stack buffers.
-- Flash: 79.3 KB of 128 KB used at `-Og` (95 KB at `-O0` before the capture module). Large constant tables belong in flash rather than RAM.
+- RAM: 2.9 KB free with the USB debug capture and the PSRAM ring built in (29.9 KB used, including a 2 KB stack, a 0.5 KB heap reservation and 1 KB of PSRAM-ring interrupt code that runs from RAM). `DEBUG_CAPTURE 0` in `debug_link.h` frees its 8 KB buffer. No malloc, no large stack buffers.
+- Flash: 81.9 KB of 128 KB used at `-Og` (95 KB at `-O0` before the capture module). Large constant tables belong in flash rather than RAM.
+- Interrupt priorities: DMA2 Channel 1 (the PSRAM ring's burst interrupt) must be the only interrupt at priority 0; everything else at 1 or lower. `PsramRing_Start()` refuses to run otherwise (boot screen: "Ring: NVIC prio"). Diary entry 34.
+  - `__disable_irq()` blocks priority 0 too. Keep masked sections in code that runs while the ring is busy to a few dozen instructions: a masked section that delays a burst's end stretches CE#. Bursts have ~3.5 µs of slack (entry 36).
 - Lookup tables are generated into `Core/DSP/Tables/` by `python Tools/gen_dsp_tables.py`: the Hann window, FFT twiddles, FFT unpack rotation and NCO sine. Don't edit them by hand. Rerun the script after changing `AUDIO_FFT_LENGTH` or `LUT_SIZE`; a static assert fails the build if a table is stale. Python 3 is installed.
 - Check `arm-none-eabi-size` after changes that add buffers or tables. When reading the .map, skip the "Discarded input sections" list at the top: symbols there were garbage-collected and use no memory.
 - Do not add the prebuilt CMSIS-DSP library: the static archive bakes in every twiddle table and overflowed flash by ~9 KB. The FFT is hand-rolled on purpose. If CMSIS-DSP is ever needed, use the source-only library so size-reduction defines work.
@@ -85,12 +87,20 @@ Unused: PA7, PA10, PA15, PB1, PB9, PC13.
 - `dsp.c`: digital heterodyne (NCO → multiply → decimate → DAC). Currently effectively zero-IF / direct conversion.
 - Sample rate: exactly 250 kHz (TIM2 ARR 679), decided Oct 30. `main.c` stops in `Error_Handler` at startup if the CubeMX TIM2 period doesn't match `pipeline_config.h`.
 - LO range 0–120 kHz (`AUDIO_LO_MAX_HZ`). The LO label is fixed at 13 characters (`LO: 120.0 kHz`) so it stays clear of the battery readout.
-- DSP load: `adc.c` records the worst-case `DSP_ProcessBlock` time in `dspCyclesMax` / `dspLoadMaxPercent` (watch in Live Expressions). One block at 250 kHz is 174,080 CPU cycles. Measured 37% at `-Og` (~252 cycles/sample).
+- DSP load: `adc.c` records the worst-case `DSP_ProcessBlock` time in `dspCyclesMax` / `dspLoadMaxPercent` (watch in Live Expressions). One block at 250 kHz is 174,080 CPU cycles. Measured 37% at `-Og` (~252 cycles/sample) without the PSRAM ring. With it: 45% while it writes, 66% while it also reads back to back (`verify`), because its burst interrupts preempt the DSP.
 - ADC2 scans LO pot / volume / V_BAT/2 via DMA1 Ch3 (`ADC2_StartScan` / `ADC2_ScanReady` / `ADC2_Get`). `ADC_Init` stops if the CubeMX rank count changes.
 - Volume: square-law digital gain (`DSP_SetVolume`). Battery voltage shows as two lines, "BAT" over "3.9", at the top right of the waterfall header.
 - `psram.c` (Core/Drivers): register-level, interrupt-masked SPI1 driver.
   - Every burst has a 10 µs deadline and returns `PSRAM_ERR_TIMEOUT` instead of hanging.
   - Tests: walking-ones address-line test and a full 8 MB pattern test.
+- `psram_ring.c` (Core/Drivers): continuous recording of the raw ADC into the PSRAM, verified on hardware 2026-10-30 (diary 34–36). The last 16.8 s (16384 blocks of 512 bytes) are always kept.
+  - From `PsramRing_Start()` (after the boot tests, before the ADC) it owns SPI1. The polled `psram.c` driver is boot-only after that.
+  - Each block is written as 32 DMA bursts of 16 bytes, on DMA2 Ch1 (RX) and Ch2 (TX). The RX transfer-complete interrupt raises CE# and starts the next burst. CE# measures 4.44 µs at most, reads included, against the 8 µs tCEM. Don't go back to 32-byte bursts: reads reached 8.1 µs (entry 36).
+  - The burst interrupt's code is marked `__RAM_FUNC` (runs from RAM), and `psram_ring.c` builds at `-O2` via a `#pragma`. It costs 2.3–2.5 µs of CPU per burst; from flash at `-Og` it was 4 µs and overran the DSP. `DMA2_Channel1_IRQHandler` returns before `HAL_DMA_IRQHandler`.
+  - `PsramRing_PushBlock` is called from the ADC callbacks in `adc.c`. `PsramRing_ReadBlock` queues a read by block number, and writes go before reads.
+  - Live Expressions: `psramRingMaxSelectNs` (must stay below 8000), `psramRingOverTcem`, `psramRingLateBlocks` and `psramRingFaults` (must stay 0), `psramRingBlocks`, `psramRingReads`.
+  - Timing diagnostics: `psramRingMinSelectNs`, `psramRingMaxEntryNs` (CE# low to interrupt start), `psramRingMaxIsrNs` (CPU per burst), `psramRingBursts`. Write 1 to `psramRingResetStats` to restart them.
+  - Verify with `python -I Tools/capture.py verify --count 50`: debug link `M` reads the last snapshot back from the ring and the PC compares it bit for bit.
 - `sd_spi.c` (FATFS/Target): SPI-mode SD driver on SPI2. FatFS is wired up through `user_diskio.c` with `_FS_TINY` on, LFN off and exFAT off, so cards must be FAT32.
 - Boot checks run before the audio starts:
   - PSRAM: hold RECORD at power-up for the full 8 MB test (~35 s).
@@ -114,6 +124,11 @@ Bugs already fixed — do not reintroduce:
 - CubeMX's default SPI data size on G4 is 4 bits. Always set 8 bits explicitly.
 - CubeMX generates SPI pins at `GPIO_SPEED_FREQ_LOW`. Use High / Very High for anything above ~20 MHz.
   - Hit on V2: SPI1 at 42.5 MHz on Low-speed pins hung waiting for RXNE. The master's receiver is clocked by SCK through the pad, and a Low-speed pad can't toggle at 42.5 MHz. High fixed it.
+- CubeMX's default SPI "NSSP Mode" on G4 is Enabled. The SPI then idles SCK for 2 clocks after every byte to pulse its NSS pin, even with software NSS: 10 clocks per byte instead of 8 (20% slower). It pushed PSRAM bursts from 7.5 µs to 9.1 µs, over tCEM. Keep it Disabled on SPI1 and SPI2; `PsramRing_Start()` refuses to run if SPI1's `CR2.NSSP` is set. Diary entry 35.
+- Code in ordinary SRAM (0x2000_0000) runs at ~2 cycles per instruction on the M4: instruction fetches and data share the system bus. Only CCM SRAM (0x1000_0000) is contention-free. Diary entry 36.
+- The linker warns "LOAD segment with RWX permissions" because the ring's interrupt code runs from RAM. Expected; not a fault.
+- Starting a debug session in CubeIDE rebuilds and flashes. Take "before" measurements before launching the debugger on new code.
+- The build string `capture.py info` prints is `debug_link.c`'s compile time, so it only changes when that file is recompiled. Use the uptime it prints to tell whether the board has restarted.
 - Don't expand an SPI `DR` register in the debugger's SFR view. The debugger's read pops the RX FIFO and can clear RXNE under the running code.
 - On the G4 SPI, access `DR` as 8 bits for 8-bit frames. A 16-bit write packs and sends two bytes.
 - GCC 14 treats a call to an undeclared function as an error. Removing a header include also means removing the calls that need it.
@@ -128,7 +143,7 @@ Bugs already fixed — do not reintroduce:
   1. V1 features running on V2. Done.
   2. PSRAM bring-up. Done; the full 8 MB test is still to run once.
   3. SD bring-up. Driver written; no card available yet (Oct 30).
-  4. RAM reclaim (done Oct 30), then the DMA-driven PSRAM ring buffer, then WAV recording to SD.
+  4. RAM reclaim (done Oct 30), then the DMA-driven PSRAM ring buffer (verified Oct 30), then WAV recording to SD.
   5. Time-expansion playback from PSRAM on PLAYBACK.
 - Amplifier gating ("squelch"): switch `AMP_EN` on only while bats are detected.
   - Stage 1 (the monitor-only detector) is built; tune it in the field first.

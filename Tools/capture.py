@@ -7,10 +7,13 @@ top of that file, and the structs below must match it.
     python -I Tools/capture.py info
     python -I Tools/capture.py raw --count 20 --label quiet-room
     python -I Tools/capture.py energy --seconds 60 --label quiet-room
+    python -I Tools/capture.py verify --count 50
 
 raw     snapshots of 4096 unprocessed ADC samples (16.4 ms each)
 energy  one record per 1.024 ms audio block: the detector's input energy,
         the full-band energy, the noise floor and the pulse counters
+verify  checks the PSRAM ring: takes a raw snapshot, reads the same blocks
+        back from the PSRAM and compares them bit for bit (nothing saved)
 
 Captures are saved as .npz files in Captures/ (beside Tools/), named with the
 date, time, kind and label. Analyse them with Tools/analyse_capture.py.
@@ -266,6 +269,47 @@ def capture_energy(reader, seconds, block_seconds):
     }
 
 
+def verify_ring(reader, count, interval, block_size):
+    """Snapshot, then the same blocks read back from the PSRAM ring: they must match exactly."""
+    failures = 0
+
+    for i in range(count):
+        reader.port.write(b"R")
+        snapshot = reader.wait_for("R", timeout=2.0)
+        if snapshot is None:
+            sys.exit(f"Snapshot {i + 1} didn't arrive")
+
+        reader.port.write(b"M")
+        copy = reader.wait_for("M", timeout=2.0)
+        if copy is None:
+            sys.exit("No reply to the PSRAM read-back: is this firmware built with the ring?")
+        if not copy.payload:
+            sys.exit("The board couldn't read the snapshot back: is the PSRAM ring running? "
+                     "(the boot screen says why not)")
+
+        adc = np.frombuffer(snapshot.payload, dtype="<u2")
+        psram = np.frombuffer(copy.payload, dtype="<u2")
+        bad = np.flatnonzero(adc != psram)
+
+        if bad.size:
+            failures += 1
+            first = bad[0]
+            print(f"  {i + 1}/{count}: ring block {copy.arg0}: {bad.size} of {adc.size} samples differ, "
+                  f"first at sample {first} (block {first // block_size}): ADC {adc[first]}, PSRAM {psram[first]}")
+        else:
+            print(f"  {i + 1}/{count}: ring block {copy.arg0}: all {adc.size} samples match")
+
+        if i + 1 < count:
+            time.sleep(interval)
+
+    compared = count * len(adc)
+    if failures:
+        print(f"FAIL: {failures} of {count} snapshots differed")
+    else:
+        print(f"PASS: {count} snapshots, {compared} samples ({2 * compared / 1024:.0f} KB) identical")
+    return failures == 0
+
+
 def save(kind, label, info, data):
     CAPTURE_DIR.mkdir(exist_ok=True)
     name = time.strftime("%Y%m%d_%H%M%S") + f"_{kind}" + (f"_{label}" if label else "") + ".npz"
@@ -285,11 +329,11 @@ def save(kind, label, info, data):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("command", choices=["info", "raw", "energy"])
+    parser.add_argument("command", choices=["info", "raw", "energy", "verify"])
     parser.add_argument("--port", help="COM port (default: find the board by its USB IDs)")
     parser.add_argument("--label", default="", help="short note for the file name, e.g. quiet-room")
-    parser.add_argument("--count", type=int, default=20, help="raw: number of snapshots (default 20)")
-    parser.add_argument("--interval", type=float, default=0.25, help="raw: seconds between snapshots")
+    parser.add_argument("--count", type=int, default=20, help="raw, verify: number of snapshots (default 20)")
+    parser.add_argument("--interval", type=float, default=0.25, help="raw, verify: seconds between snapshots")
     parser.add_argument("--seconds", type=float, default=60.0, help="energy: how long to record")
     args = parser.parse_args()
 
@@ -300,6 +344,11 @@ def main():
         reader = FrameReader(port)
         info = read_info(reader)
         print_info(info)
+
+        if args.command == "verify":
+            passed = verify_ring(reader, args.count, args.interval, info["block_size"])
+            port.write(b"S")
+            sys.exit(0 if passed else 1)
 
         if args.command == "raw":
             data = capture_raw(reader, args.count, args.interval)

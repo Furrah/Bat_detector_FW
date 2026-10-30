@@ -9,6 +9,8 @@
  *   'R'  raw snapshot: the next DEBUG_SNAPSHOT_BLOCKS ADC blocks, unprocessed
  *   'E'  start streaming per-block energies and the detector state
  *   'S'  stop streaming
+ *   'M'  read the last raw snapshot's blocks back from the PSRAM ring, so
+ *        the PC can check them against the snapshot bit for bit
  *
  * The frame format is described at the top of debug_link.c.
  *
