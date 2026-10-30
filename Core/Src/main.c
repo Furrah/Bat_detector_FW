@@ -29,6 +29,8 @@
 #include "pipeline_config.h"
 #include "adc.h"
 #include "dsp.h"
+#include "bat_detect.h"
+#include "debug_link.h"
 #include "dac.h"
 #include "psram.h"
 #include "sd_spi.h"
@@ -58,6 +60,9 @@
 // ends at x=213, which leaves too little room for "3.9V" on one line.
 #define VBAT_TEXT_X        218U
 #define VBAT_TEXT_Y        5U
+
+// LED1 flash per detected bat pulse; long enough to see (calls are 1-30 ms)
+#define PULSE_LED_MS       50U
 
 /* USER CODE END PD */
 
@@ -377,6 +382,13 @@ int main(void)
 
   /* USER CODE BEGIN SysInit */
 
+  /* CubeMX writes HSI48CalibrationValue = 32, but the G4's CRS TRIM is 7 bits
+   * with 64 as the middle; 32 would start HSI48 ~4-5% slow. TRIM is read-only
+   * while auto-trim runs, so pause it to write the value. */
+  CLEAR_BIT(CRS->CR, CRS_CR_AUTOTRIMEN);
+  MODIFY_REG(CRS->CR, CRS_CR_TRIM, RCC_CRS_HSI48CALIBRATION_DEFAULT << CRS_CR_TRIM_Pos);
+  SET_BIT(CRS->CR, CRS_CR_AUTOTRIMEN);
+
   /* USER CODE END SysInit */
 
   /* Initialize all configured peripherals */
@@ -402,6 +414,7 @@ int main(void)
 
   ADC_Init();
   DSP_Init();
+  BatDetect_Init();
   DAC_Init();
   FFT_Init();
 
@@ -462,6 +475,9 @@ int main(void)
   uint32_t vbat_sum = 0;
   uint32_t vbat_count = 0;
 
+  uint32_t lastPulseCount = 0;
+  uint32_t pulseLedOffTick = 0;
+
   Waterfall_SetLOFrequency(frequency);
 
 
@@ -495,23 +511,6 @@ int main(void)
 	            DSP_SetMixerFrequency((float)frequency);
 	            LO_SetFrequency(frequency);
 
-	            if(frequency >= 60000U)
-	            {
-	                HAL_GPIO_WritePin(GPIOB, LED0_Pin, GPIO_PIN_SET);
-	                HAL_GPIO_WritePin(GPIOB, LED1_Pin, GPIO_PIN_RESET);
-	            }
-	            else if(frequency >= 30000U)
-	            {
-	                HAL_GPIO_WritePin(GPIOB, LED0_Pin, GPIO_PIN_RESET);
-	                HAL_GPIO_WritePin(GPIOB, LED1_Pin, GPIO_PIN_SET);
-	            }
-	            else
-	            {
-	                HAL_GPIO_WritePin(GPIOB, LED0_Pin, GPIO_PIN_RESET);
-	                HAL_GPIO_WritePin(GPIOB, LED1_Pin, GPIO_PIN_RESET);
-	            }
-
-
 	            lastADC = adc;
 
 	            // fixed 13-char width: ends at x=213, clear of the battery readout
@@ -519,8 +518,27 @@ int main(void)
 	            ILI9341_WriteString(5,5,text,Font_16x26,ILI9341_WHITE,ILI9341_BLACK);
 	        }
 
+	        // Bat detector, stage 1 (monitor only, the amp stays on):
+	        // LED0 = bat pass in progress, LED1 = flash for each bat-like pulse
+	        HAL_GPIO_WritePin(LED0_GPIO_Port, LED0_Pin,
+	                BatDetect_IsBatPresent() ? GPIO_PIN_SET : GPIO_PIN_RESET);
 
+	        uint32_t pulseCount = BatDetect_GetPulseCount();
+
+	        if(pulseCount != lastPulseCount)
+	        {
+	            lastPulseCount = pulseCount;
+	            pulseLedOffTick = lastRead + PULSE_LED_MS;
+	            HAL_GPIO_WritePin(LED1_GPIO_Port, LED1_Pin, GPIO_PIN_SET);
+	        }
+	        else if((int32_t)(lastRead - pulseLedOffTick) >= 0)
+	        {
+	            HAL_GPIO_WritePin(LED1_GPIO_Port, LED1_Pin, GPIO_PIN_RESET);
+	        }
 	    }
+
+	    // USB debug capture: act on PC commands, send any data that's ready
+	    DebugLink_Poll();
 
 	    FFT_Process();
 
@@ -566,6 +584,7 @@ void SystemClock_Config(void)
 {
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+  RCC_CRSInitTypeDef pInit = {0};
 
   /** Configure the main internal regulator output voltage
   */
@@ -602,6 +621,21 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
+
+  /** Enable the SYSCFG APB clock
+  */
+  __HAL_RCC_CRS_CLK_ENABLE();
+
+  /** Configures CRS
+  */
+  pInit.Prescaler = RCC_CRS_SYNC_DIV1;
+  pInit.Source = RCC_CRS_SYNC_SOURCE_USB;
+  pInit.Polarity = RCC_CRS_SYNC_POLARITY_RISING;
+  pInit.ReloadValue = __HAL_RCC_CRS_RELOADVALUE_CALCULATE(48000000,1000);
+  pInit.ErrorLimitValue = 34;
+  pInit.HSI48CalibrationValue = 32;
+
+  HAL_RCCEx_CRSConfig(&pInit);
 }
 
 /**

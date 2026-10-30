@@ -33,6 +33,12 @@ _Static_assert((AUDIO_TIMER_CLOCK_HZ % AUDIO_TIMER_PERIOD) == 0UL,
 #define AUDIO_BLOCK_SIZE        256U
 #define AUDIO_BUFFER_SIZE       (2U * AUDIO_BLOCK_SIZE)
 
+/* Duration of one block, used to turn millisecond timings into block counts */
+#define AUDIO_BLOCK_US          ((AUDIO_BLOCK_SIZE * 1000000UL) / AUDIO_SAMPLE_RATE_HZ)   /* 1024 */
+
+_Static_assert(((AUDIO_BLOCK_SIZE * 1000000UL) % AUDIO_SAMPLE_RATE_HZ) == 0UL,
+        "block duration must be a whole number of microseconds");
+
 
 /* Real samples per FFT frame (bin width = sample rate / this) */
 #define AUDIO_FFT_LENGTH        1024U

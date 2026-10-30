@@ -16,8 +16,9 @@ Handheld, battery-powered ultrasonic bat detector covering the 20–120 kHz echo
 
 - CubeMX-generated files: only edit inside `/* USER CODE BEGIN */ … /* USER CODE END */` blocks. Anything outside is wiped when the .ioc is regenerated.
 - Make incremental, targeted changes scoped to the function or module in question, with the rationale stated. No whole-file rewrites.
-- RAM is tight: ~5.5 KB free (27.1 KB used incl. 1.5 KB heap+stack, Oct 30). No malloc, no large stack buffers.
-- Flash: 66.8 KB of 128 KB used at `-Og` (it was 95 KB at `-O0`). Large constant tables belong in flash rather than RAM.
+- RAM: 4.3 KB free with the USB debug capture built in (28.4 KB used, including a 2 KB stack and 0.5 KB heap reservation). `DEBUG_CAPTURE 0` in `debug_link.h` frees its 8 KB buffer. No malloc, no large stack buffers.
+- Flash: 79.3 KB of 128 KB used at `-Og` (95 KB at `-O0` before the capture module). Large constant tables belong in flash rather than RAM.
+- Lookup tables are generated into `Core/DSP/Tables/` by `python Tools/gen_dsp_tables.py`: the Hann window, FFT twiddles, FFT unpack rotation and NCO sine. Don't edit them by hand. Rerun the script after changing `AUDIO_FFT_LENGTH` or `LUT_SIZE`; a static assert fails the build if a table is stale. Python 3 is installed.
 - Check `arm-none-eabi-size` after changes that add buffers or tables. When reading the .map, skip the "Discarded input sections" list at the top: symbols there were garbage-collected and use no memory.
 - Do not add the prebuilt CMSIS-DSP library: the static archive bakes in every twiddle table and overflowed flash by ~9 KB. The FFT is hand-rolled on purpose. If CMSIS-DSP is ever needed, use the source-only library so size-reduction defines work.
 - Buffer sizes, the sample rate and the FFT length come from `Core/Inc/pipeline_config.h` (`AUDIO_SAMPLE_RATE_HZ`, `AUDIO_BLOCK_SIZE`, `AUDIO_BUFFER_SIZE`, `AUDIO_FFT_LENGTH`, `AUDIO_LO_MAX_HZ`). Never hard-code them. Module constants such as `ADC_BUFFER_SIZE`, `DSP_BLOCK_SIZE` and `WF_SAMPLE_RATE_HZ` are aliases of it.
@@ -66,6 +67,20 @@ Unused: PA7, PA10, PA15, PB1, PB9, PC13.
 
 - ADC→DAC DMA passthrough, timer-triggered, ping-pong buffering.
 - `fft.c`: 1024 real samples packed into a 512-point complex FFT, Hann window, unpacked with the half-length real-FFT identity. Outputs 513 unnormalised linear-magnitude bins in `fftMagnitude[]`.
+  - The window, twiddles and unpack rotation come from the flash tables.
+  - `fftProcessCyclesAvg` / `fftProcessCyclesMax` time `FFT_Process`. Measured 2.14 ms per frame (5.77 ms with the old `cosf`/`sinf` unpack).
+- `bat_detect.c` (Core/DSP): bat-call detector, stage 1 (monitor only; the amp stays on).
+  - Runs once per block from `DSP_ProcessBlock`, on the energy of the 10 kHz high-pass output.
+  - Tracks the noise floor, finds pulses (1–100 ms long, more than 10 dB above the floor), and triggers on 2 pulses within 600 ms, with a 2 s hold.
+  - LED0 = bat pass in progress; LED1 = 50 ms flash per pulse. These replace V1's LO-band LEDs.
+  - Live Expressions: `batEnergyDb`, `batFloorDb`, `batPulses`, `batTriggers`, `batNoiseRuns`, `batPresent`.
+  - Parameter reasoning is in diary entry 30.
+- `debug_link.c` (Core/Src; header in Core/Inc so dsp.c and the USB code can include it): USB CDC debug capture, built 2026-10-30.
+  - The PC sends one byte: `I` info, `R` a raw 4096-sample snapshot, `E` / `S` start / stop one energy record per block. Replies are CRC-32 framed; the format is at the top of `debug_link.c`.
+  - Hooks: `DebugLink_AddBlock` in `DSP_ProcessBlock`, `DebugLink_OnReceive` in `usbd_cdc_if.c` `CDC_Receive_FS`, `DebugLink_Poll` in the main loop.
+  - PC side: `python -I Tools/capture.py info|raw|energy --label <note>` saves `Captures/*.npz`. `python -I Tools/analyse_capture.py <file.npz>` prints the analysis and writes a PNG: spectrum lines, noise, the detector's predicted input, energy periodicities, and an offline detector replay with a threshold sweep. Needs `python -m pip install pyserial numpy matplotlib` (installed).
+  - Keep `DETECTOR` in `analyse_capture.py` in step with `bat_detect.c`; the replay reports if it disagrees with the board.
+- `dac.c`: each DSP block is copied straight into the half of the circular DAC buffer that the DMA isn't reading, chosen from the DMA's remaining count (CNDTR). `dacLateBlocks` counts blocks that collided with the DMA; it should stay 0.
 - `waterfall.c/.h`: built on the afiskon ILI9341 driver with VSCRDEF/VSCRSADD hardware scroll patched into the driver. Portrait native orientation, peak-hold accumulator (so short calls aren't lost between rows), thermal palette, bins 0–1 excluded, ticks every 20 kHz, LO frequency readout at the top. dB conversion happens here. `Waterfall_SetRange` was calibrated from measured dB values.
 - `dsp.c`: digital heterodyne (NCO → multiply → decimate → DAC). Currently effectively zero-IF / direct conversion.
 - Sample rate: exactly 250 kHz (TIM2 ARR 679), decided Oct 30. `main.c` stops in `Error_Handler` at startup if the CubeMX TIM2 period doesn't match `pipeline_config.h`.
@@ -103,6 +118,8 @@ Bugs already fixed — do not reintroduce:
 - On the G4 SPI, access `DR` as 8 bits for 8-bit frames. A 16-bit write packs and sends two bytes.
 - GCC 14 treats a call to an undeclared function as an error. Removing a header include also means removing the calls that need it.
 - If LSE is enabled with Y1 not fitted, `SystemClock_Config` times out and `Error_Handler` hangs with IRQs off. The board looks dead.
+- USB on V2 enumerates in only one USB-C plug orientation (Oct 30). The other way round, Windows reports "Device Descriptor Request Failed", `USB->FNR` reads 0xC000 (D− high) and `DADDR` stays 0: D− isn't connected that way, probably a dry joint on J8 A7/B7. Use the working orientation until J8 is reflowed. Diary entry 31.
+- CubeMX's CRS settings (CRS SYNC = USB_FS) write `HSI48CalibrationValue = 32`, and the field can't be edited. The G4's trim is 7 bits with 64 as the middle, so `main.c`'s `USER CODE SysInit` block puts it back to 64. `CRS->CR` should read 0x4060 before USB starts.
 - The RTC prescalers must match its clock source: (Asynch+1)(Synch+1) = f_RTC. CubeMX's 127/255 default is for 32.768 kHz; HSE/32 = 500 kHz needs 124/3999.
 
 ## Next up
@@ -111,14 +128,13 @@ Bugs already fixed — do not reintroduce:
   1. V1 features running on V2. Done.
   2. PSRAM bring-up. Done; the full 8 MB test is still to run once.
   3. SD bring-up. Driver written; no card available yet (Oct 30).
-  4. RAM reclaim (below), then the DMA-driven PSRAM ring buffer, then WAV recording to SD.
+  4. RAM reclaim (done Oct 30), then the DMA-driven PSRAM ring buffer, then WAV recording to SD.
   5. Time-expansion playback from PSRAM on PLAYBACK.
-- Free RAM before recording (~8 KB reclaimable):
-  - `windowCoeff` / twiddles / `sineTable`: 7 KB, can be const tables in flash.
-  - `dacQueue`: 1 KB, goes away with the DAC fix below.
-  - Raise the stack to 2 KB for FatFS.
+- Amplifier gating ("squelch"): switch `AMP_EN` on only while bats are detected.
+  - Stage 1 (the monitor-only detector) is built; tune it in the field first.
+  - Stage 2: drive `AMP_EN` from it, with a fade, amp off at zero volume, and forced on during playback.
+  - The squelch-off (always-on) control is deferred.
 - Recording architecture: SD writes can stall 100–250 ms (up to ~96 KB at 384 kB/s), so PSRAM writes must be driven from the ADC ISR side. One ISR-driven SPI1 engine owns the PSRAM; the SD writer and the playback prefetch queue read requests to it.
-- DAC double-buffering fix: `DAC_WriteBlock` must write to the correct circular-buffer half.
 - Finish the DSP chain: bandpass around the 1–2 kHz output, float throughout to avoid inter-stage truncation, and wire in the notch filter. It is initialised in `DSP_Init` but not connected in `DSP_ProcessBlock`, and `dsp_filters.h` hasn't been reviewed yet.
 - Time-expansion mode: capture a detected call from PSRAM and play it back slowed down. The record button writes the PSRAM pre-trigger data to SD, followed by the live stream.
 - WAV header formatting compatible with bat-ID software.
@@ -129,6 +145,7 @@ Bugs already fixed — do not reintroduce:
 ## Open decisions
 
 - Fit Y1, which is needed for an RTC that survives power-off (WAV timestamps).
+- Squelch-off control: which button or gesture forces the audio on (deferred, Oct 30).
 - GPS: in or out of v2 scope (it would fix RTC drift across power gaps).
 - MEMS mic response shaping at the top of the band vs flat boost.
 - Deferred from v2: USB audio (384 kHz USB mic).

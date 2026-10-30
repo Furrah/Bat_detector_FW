@@ -11,41 +11,13 @@
 
 extern DAC_HandleTypeDef hdac1;
 
-static volatile uint8_t blocksAvailable = 0;
 static uint16_t dacBuffer[DAC_BUFFER_SIZE];
-static uint16_t dacQueue[DAC_BUFFER_SIZE];
 
-static volatile uint8_t dacBlockReady = 0;
-
-
-void HAL_DAC_ConvHalfCpltCallbackCh1(
-        DAC_HandleTypeDef *hdac)
-{
-    if(dacBlockReady)
-    {
-        for(uint32_t i=0;i<DAC_BLOCK_SIZE;i++)
-        {
-            dacBuffer[i]=dacQueue[i];
-        }
-
-        dacBlockReady=0;
-    }
-}
-
-
-void HAL_DAC_ConvCpltCallbackCh1(
-        DAC_HandleTypeDef *hdac)
-{
-    if(dacBlockReady)
-    {
-        for(uint32_t i=0;i<DAC_BLOCK_SIZE;i++)
-        {
-            dacBuffer[DAC_BLOCK_SIZE+i]=dacQueue[i];
-        }
-
-        dacBlockReady=0;
-    }
-}
+/*
+ * Blocks whose copy overlapped the DMA crossing into the half being
+ * written (an audible glitch). Should stay 0; watch in Live Expressions.
+ */
+volatile uint32_t dacLateBlocks = 0;
 
 
 void DAC_Init(void)
@@ -71,19 +43,35 @@ void DAC_Start(void)
 
 }
 
+/*
+ * Copy a processed block straight into the half of the circular DAC
+ * buffer that the DMA is not reading. The DMA's remaining count (CNDTR)
+ * says where it is: more than one block left means it is still in the
+ * first half. This works whichever of ADC and DAC was started first.
+ */
 void DAC_WriteBlock(
         const uint16_t *input,
         uint32_t length)
 {
+    uint32_t inFirstHalf;
+    uint16_t *half;
+
     if(length != DAC_BLOCK_SIZE)
         return;
 
+    inFirstHalf = (__HAL_DMA_GET_COUNTER(hdac1.DMA_Handle1) > DAC_BLOCK_SIZE);
+    half = inFirstHalf ? &dacBuffer[DAC_BLOCK_SIZE] : &dacBuffer[0];
+
     for(uint32_t i=0;i<DAC_BLOCK_SIZE;i++)
     {
-        dacQueue[i]=input[i];
+        half[i]=input[i];
     }
 
-    dacBlockReady=1;
+    /* if the DMA changed half during the copy, it reached the block being written */
+    if((__HAL_DMA_GET_COUNTER(hdac1.DMA_Handle1) > DAC_BLOCK_SIZE) != inFirstHalf)
+    {
+        dacLateBlocks++;
+    }
 }
 
 

@@ -106,3 +106,6 @@ latex/
 
 __pycache__/
 *.pyc
+
+# Debug captures from Tools/capture.py (about 1 MB per energy run)
+Captures/
