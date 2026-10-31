@@ -84,7 +84,12 @@ Unused: PA7, PA10, PA15, PB1, PB9, PC13.
   - Keep `DETECTOR` in `analyse_capture.py` in step with `bat_detect.c`; the replay reports if it disagrees with the board.
 - `dac.c`: each DSP block is copied straight into the half of the circular DAC buffer that the DMA isn't reading, chosen from the DMA's remaining count (CNDTR). `dacLateBlocks` counts blocks that collided with the DMA; it should stay 0.
 - `waterfall.c/.h`: built on the afiskon ILI9341 driver with VSCRDEF/VSCRSADD hardware scroll patched into the driver. Portrait native orientation, peak-hold accumulator (so short calls aren't lost between rows), thermal palette, bins 0–1 excluded, ticks every 20 kHz, LO frequency readout at the top. dB conversion happens here. `Waterfall_SetRange` was calibrated from measured dB values.
-- `dsp.c`: digital heterodyne (NCO → multiply → decimate → DAC). Currently effectively zero-IF / direct conversion.
+- `dsp.c`: digital heterodyne, per sample in `DSP_ProcessBlock`. There is no decimation: the output runs at the full 250 kHz.
+  - Chain: −2048 → 10 kHz Butterworth high-pass biquad → ×`DSP_GAIN` (8) → `DSP_Mixer` → two cascaded 8 kHz Butterworth low-pass biquads → × volume → +2048, clamp to 0–4095 → `DAC_WriteBlock`.
+  - `DSP_Mixer`: a 32-bit phase-accumulator NCO indexing the 512-entry flash sine table (`phase >> 23`), with a Q15 multiply.
+  - The sample is cast back to `int32_t` between stages, so each stage truncates.
+  - The high-pass output is also squared and summed per block for the bat detector. The raw input block goes to the FFT and the debug link.
+  - During playback, the mixer and low-passes are skipped.
 - Sample rate: exactly 250 kHz (TIM2 ARR 679), decided Oct 30. `main.c` stops in `Error_Handler` at startup if the CubeMX TIM2 period doesn't match `pipeline_config.h`.
 - LO range 0–120 kHz (`AUDIO_LO_MAX_HZ`). The LO label is fixed at 13 characters (`LO: 120.0 kHz`) so it stays clear of the battery readout.
 - DSP load: `adc.c` records the worst-case `DSP_ProcessBlock` time in `dspCyclesMax` / `dspLoadMaxPercent` (watch in Live Expressions). One block at 250 kHz is 174,080 CPU cycles. Measured 37% at `-Og` (~252 cycles/sample) without the PSRAM ring. With it: 45% while it writes, 66% while it also reads back to back (`verify`), because its burst interrupts preempt the DSP.
