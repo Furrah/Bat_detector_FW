@@ -553,6 +553,101 @@ Entries are in order, with the newest at the bottom. Decisions that are agreed b
 - **Lessons for future designs:**
   - Check a storage self-test with an independent reader. A readback through the same driver passes even when a consistent addressing bug puts the data in the wrong place.
   - Make a speed test match the real workload: transfer size, CPU load, bus sharing and duration. Otherwise, say what it leaves out. This one measures the slowest transfer size in the easiest conditions.
+- **Corrections (from entry 39's measurements):** the card has 30,540,800 sectors, not 30,539,776. The boot test's "kB/s" are KiB/s, so 666 KiB/s is 682 kB/s and the boot headroom was 1.36×, not 1.33×.
+
+### 39. Multi-sector SD writes (8 at a time); the FFT at -O2; next, SPI2 DMA (Nov 2)
+- **Decision:**
+  - Single-sector writes can't keep up with recording under load (0.82–0.88×). Writes of 8 sectors (CMD25 multi-block) reach 1.41× while catching up a pre-trigger, and 2.0× once caught up.
+  - `fft.c` builds at `-O2` and reverses bits with `RBIT`: 1.84× faster. CMSIS-DSP was considered and rejected.
+  - Next: move the SD data blocks on SPI2 to DMA, then measure again.
+- **Context:** entry 38 left the write size to a sustained test under load. Three tools were built for it:
+  - `sd_bench.c` with `capture.py sdtest`: copies the ring's live audio to `SDBENCH.RAW`, starting a 5 s pre-trigger behind, with everything else running. The writer runs ahead of the FFT in the main loop, as a recorder would have to.
+  - `capture.py stats`: reads every Live Expressions counter over USB and flags any out of limits.
+  - `capture.py fftcheck`: the board's FFT result for a captured frame, against numpy.
+- **Measured, single sector (first run, FFT still at `-Og`):** 411 kB/s = 0.82×. The backlog grew from 5 s to 15.6 s of the ring's 16.8 s in 60 s. Most `f_write` calls took 1–2 ms (0.75 ms at boot), the slowest 82 ms. DSP worst case 54%.
+- **Measured, sweep of sectors per write (FFT at `-O2`; 60 s each, 5 s pre-trigger, 0 blocks lost in every run):**
+
+  | Sectors | Rate catching up | Headroom | `f_write` time per sector | Busy once caught up | Slowest write | FFT drops |
+  |---|---|---|---|---|---|---|
+  | 1 | 440 kB/s | 0.88× | 1.02 ms | never caught up | 81.7 ms | 82% |
+  | 4 | 601 kB/s | 1.20× | 0.75 ms | 57% | 15.6 ms | 56% |
+  | 8 | 704 kB/s | 1.41× | 0.64 ms | 50% | 14.3 ms | 50% |
+  | 16 | 636 kB/s | 1.27× | 0.47 ms | 48% | 16.3 ms | 55% |
+
+- **Measured, FFT:**
+  - `-Og` → `-O2`: 398k → 216k cycles per frame on average (2.34 → 1.27 ms, interrupts included); worst case 2.75 → 1.67 ms.
+  - Blocks the FFT drops: 36% → 20%, with no SD traffic. DSP worst case 46% → 44% (`FFT_AddSamples` runs in the audio interrupt).
+  - `fftcheck`: the board matches numpy's `rfft` to 6.8×10⁻⁸ of the largest bin (−143 dB) over 10 frames: float32 rounding.
+- **Why:**
+  - **The interrupts stretch the writer.** They take 45–54% of the CPU, which roughly doubles any CPU-bound work: 0.75 ms per sector at boot became 1.0–1.2 ms.
+  - **Multi-sector writes remove the per-command costs.** Time per sector falls from 1.02 to 0.47 ms between 1 and 16 sectors.
+  - **8 beats 16 overall.** At 16 the whole 8 KB buffer is one chunk, so the next chunk's ring reads wait for the write: only 58% of the catch-up time was spent writing, against 88% at 8.
+  - **The data transfer is now the main cost.** At 16 sectors there's no per-command overhead left, yet a sector takes 0.47 ms against 0.19 ms on the wire. That points at the polled 512-byte transfer being stretched by interrupts. It's an inference, not a measured split, and DMA is the test of it.
+  - **Multi-sector writes also cut the worst write** from 82 ms to 14–16 ms, over 60 s per setting on a freshly formatted card.
+  - **The ring's read queue went from 4 to 16** (+144 B), so a whole chunk can be queued while the last one is written.
+  - **Recording costs elsewhere:** the DSP worst case rose to 63%, because the ring now reads back to back, and the FFT drops half its blocks.
+- **Alternatives considered:**
+  - **SPI2 at 42.5 MHz (÷2):** above SPI mode's 25 MHz without CMD6 high-speed mode; 11.8 ns of MISO margin against the card's allowed 14 ns output delay; and an estimated gain to only 450–490 kB/s single-sector. Rejected.
+  - **Splitting a sector's time first:** skipped for measuring multi-sector writes directly. The sweep's per-sector times gave most of the answer anyway.
+  - **CMSIS-DSP for the FFT:** `arm_rfft_fast_f32` needs a 4 KB output buffer (1.3 KB free). `arm_cfft_f32` in place would fit and might be ~3× faster (Arm quotes ~55k cycles for a 1024-point real FFT; unverified). It would need vendored source built at `-O3`. `-O2` gave 1.84× for ten lines. Rejected.
+  - **Accepting 8 sectors at 1.41× and moving on to WAV:** deferred until DMA has been measured.
+- **Outcome:** 8-sector writes keep up with recording, by a thin margin by our thresholds (below 1.6× while catching up). The ring stayed in spec throughout: CE# worst 5.22 µs, no faults or late blocks.
+  - Found on the way: ST's FatFS glue (`diskio.c`) initialises the card only once per boot. A card that fails the boot check returns `FR_DISK_ERR` until the next reset. A fix is still to be proposed.
+- **Lessons for future designs:**
+  - Benchmark storage under the real load. The interrupts doubled the time per sector.
+  - Multi-block writes pay off most when the writer can read ahead: double-buffering beat a bigger chunk.
+  - Try the optimisation level of one hot file before swapping in a library.
+  - Check what generated glue code does after a failure, not only when it succeeds.
+
+### 40. SD data blocks stay polled; DMA dropped over an unexplained fault; recovery added (Nov 2)
+- **Decision:**
+  - The SD driver sends and receives its 512-byte data blocks polled, and the recorder will use 8-sector multi-block writes.
+  - SPI2 DMA was tried, first through HAL and then at register level. It's kept in the code behind `sdUseDma`, switched off.
+  - Added:
+    - a failed read or write now re-initialises the card and retries once;
+    - a fix to ST's FatFS glue, so a card that failed to start is retried on the next mount or open;
+    - driver diagnostics in `capture.py stats`;
+    - one test file per setting, and a PC checker (`Tools/check_raw.py`).
+- **Context:** entry 39 chose DMA to stop the interrupts stretching each polled 512-byte transfer.
+- **What happened (with numbers):**
+  - **HAL DMA** (SPI2_RX on DMA1 Ch4, TX on Ch5) gave no gain where it could be measured: single-sector writes ran at 442 kB/s, against 441 polled.
+    - Writes failed after 36k, 7.8k and 48k blocks. The data response was 0xFF, and every later write failed until a reset.
+    - The multi-sector sweep never ran long enough to measure DMA's real benefit.
+  - **A/B in one build:** polled ran 103,390 blocks clean; DMA failed at 47,882.
+  - **The failure's signature:**
+    - the response to CMD24 was 0xFF (none at all);
+    - CMD13 afterwards was clean (R1 0x00, R2 0x00);
+    - a probe that keeps clocking found the card answering 6 to 281 bytes late, with 0xFE, 0xFC or 0xF9, or once a byte-aligned 0xE5 ("accepted").
+
+    The card missed the block's start token, then locked onto a token-like bit pattern in the audio data and took the 512 bytes from there as the block. Since CRC checking is off in SPI mode, it writes that shifted block without complaint.
+  - **Ruled out, one diagnostic at a time:**
+    - HAL refusing a 1-byte transfer: 0 cases;
+    - leftover data in SPI2's receive FIFO: 0;
+    - busy timeouts: worst wait 11 ms, against a 500 ms timeout;
+    - card errors: CMD13 always clean;
+    - chip-select glitches from code: every GPIOB write is atomic;
+    - HAL's interrupt handling: register-level DMA, full duplex, with no interrupts and no receive overruns, failed the same way after 4.2 s.
+  - **Unexplained:** why only DMA triggers it. One hypothesis, not verified: a false "ready" before CMD24 while the card was still programming.
+  - **After the desyncs, the card stopped answering CMD0**, and only a power cycle brought it back.
+    - The first polled 8-sector run after them failed at 5.9 s, and the recovery couldn't restart the card.
+    - The same "no answer to CMD0" state was seen at 12:38, before any DMA code existed, after the USB cables were swapped. Flashing resets the MCU but not the card.
+  - **After a power cycle and a fresh format:**
+    - 8-sector polled writes ran 180 s and 180,880 blocks (92.6 MB) with no errors, recoveries or self-check anomalies;
+    - rate: 1.38× while catching up (a 5 s pre-trigger cleared in 13.1 s), 1.93× once caught up;
+    - worst write 22.2 ms, worst busy wait 16.1 ms, against 11.8 s of ring slack.
+  - **PC check:**
+    - all 92,610,560 bytes present, and every 16-bit word a 12-bit ADC code;
+    - the largest step across a block boundary (71) no bigger than inside a block (94);
+    - chkdsk clean.
+- **Alternatives considered:**
+  - **Keep debugging DMA:** a flight recorder of the last ~96 bytes exchanged, and a pull-up on MISO (V2 has none; PB14 floats when the card is deselected).
+  - **Fall back to polled.** Chosen: polled meets the requirement, DMA showed no measured gain, and its fault is rare but unexplained.
+- **Costs:** flash 88.7 KB, RAM about 1.0 KB free. The CubeMX SPI2 DMA setup stays, because the dormant code relies on its DMAMUX routing. It costs ~0.2 KB of RAM for two DMA handles; remove it in CubeMX if that RAM is needed.
+- **Lessons for future designs:**
+  - Measure an optimisation's gain before chasing a fault in it. DMA gained nothing at single-sector, and its multi-sector gain was never measured.
+  - An SD card in SPI mode that misses a start token writes a shifted block without complaint. Count every abnormal response, probe what the card does next, and verify the data on the PC.
+  - A card that has been fed garbage can need a power cycle; CMD0 alone may not bring it back. Power-cycle the card (S1) between failing tests.
+  - FatFS writes a file's directory entry only on `f_sync` or `f_close`, so an aborted write leaves an empty file and lost cluster chains. The recorder should `f_sync` periodically.
 
 ---
 
@@ -631,6 +726,13 @@ Entries are in order, with the newest at the bottom. Decisions that are agreed b
 - Choose a time-expansion factor from the whole output chain's passband, not just a target pitch (entry 37).
 - Check a storage self-test with an independent reader: a readback through the same driver can't catch a consistent addressing bug (entry 38).
 - Make a speed test match the real workload (transfer size, CPU load, bus sharing, duration), or say what it leaves out (entry 38).
+- Benchmark storage under the real load; interrupts doubled the SD time per sector (entry 39).
+- Multi-block writes pay off most when the writer reads ahead: double-buffering beat a bigger chunk (entry 39).
+- Try the optimisation level of one hot file before swapping in a library (entry 39).
+- Check what generated glue code does after a failure, not only when it succeeds (entry 39).
+- Measure an optimisation's gain before chasing a fault in it (entry 40).
+- Without CRC, an SD card that misses a start token writes a shifted block silently: probe abnormal responses and verify data on the PC (entry 40).
+- Power-cycle an SD card between failing tests; CMD0 alone may not bring it back (entry 40).
 
 ---
 
