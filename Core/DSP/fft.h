@@ -31,8 +31,20 @@ void FFT_AddSamples(const uint16_t *input, uint32_t length);
  */
 void FFT_Process(void);
 
+/*
+ * Debug capture, for checking the FFT against numpy: the next whole frame's
+ * raw ADC codes (FFT_LENGTH, in order) go into raw, and FFT_Process's
+ * magnitudes for that frame (FFT_NUM_BINS, before bins 0-1 are blanked)
+ * into magnitude. Main loop only.
+ */
+void FFT_RequestCapture(uint16_t *raw, float *magnitude);
+uint8_t FFT_CaptureDone(void);
+void FFT_CancelCapture(void);
+
 extern volatile uint8_t fftMagnitudeReady;
 extern volatile uint32_t fftDroppedBlocks;
+extern volatile uint32_t fftProcessCyclesAvg;
+extern volatile uint32_t fftProcessCyclesMax;
 extern float fftMagnitude[FFT_NUM_BINS];
 
 #endif /* DSP_FFT_H_ */

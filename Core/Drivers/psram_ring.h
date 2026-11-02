@@ -89,4 +89,19 @@ PsramRing_ReadResult_t PsramRing_ReadBlock(uint32_t block, void *dest, volatile 
 void PsramRing_IRQHandler(void);
 
 
+/* Health and timing counters (psram_ring.c describes each); the debug link
+ * reports them. Write 1 to psramRingResetStats to restart the timings. */
+extern volatile uint32_t psramRingBlocks;
+extern volatile uint32_t psramRingMaxSelectNs;
+extern volatile uint32_t psramRingLateBlocks;
+extern volatile uint32_t psramRingFaults;
+extern volatile uint32_t psramRingReads;
+extern volatile uint32_t psramRingMinSelectNs;
+extern volatile uint32_t psramRingMaxEntryNs;
+extern volatile uint32_t psramRingMaxIsrNs;
+extern volatile uint32_t psramRingOverTcem;
+extern volatile uint32_t psramRingBursts;
+extern volatile uint32_t psramRingResetStats;
+
+
 #endif /* DRIVERS_PSRAM_RING_H_ */

@@ -11,6 +11,15 @@
  *   'S'  stop streaming
  *   'M'  read the last raw snapshot's blocks back from the PSRAM ring, so
  *        the PC can check them against the snapshot bit for bit
+ *   'W'  start the SD write test (sd_bench.h). The next three bytes are the
+ *        pre-trigger in seconds (0-15), the sectors per write (1, 2, 4, 8
+ *        or 16) and 1 for DMA or 0 for polled transfers. 'S' stops it; the
+ *        result follows.
+ *   'N'  names and types of the timing and health counters
+ *   'T'  their current values
+ *   'Z'  restart the worst-case timings (DSP, FFT, PSRAM ring)
+ *   'F'  capture the next FFT frame's raw input and FFT_Process's output for
+ *        it, so the PC can check the FFT against numpy
  *
  * The frame format is described at the top of debug_link.c.
  *

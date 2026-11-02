@@ -20,9 +20,18 @@
  *   'M'  payload: the last snapshot's blocks as read back from the PSRAM
  *        ring, arg0 = ring block number of the first, arg1 = sample rate.
  *        Empty, with arg0 = 0xFFFFFFFF, if they can't be read.
+ *   'W'  payload: SdBench_Result_t (sd_bench.h), sent when the SD write
+ *        test ends
+ *   'N'  payload: the stats table, arg0 entries of arg1 (32) bytes: name
+ *        (27 chars, NUL-padded), type ('u' uint32, 'b' uint8, 'f' float),
+ *        then 4 bytes the PC ignores
+ *   'T'  payload: arg0 stat values in table order, 4 bytes each (uint8s
+ *        widened, floats as their bits), arg1 = uptime in ms
+ *   'F'  payload: one FFT frame's arg0 raw ADC codes (uint16), then
+ *        FFT_Process's arg1 magnitudes for it (float), bins 0-1 included
  *
- * One 8 KB buffer holds either the snapshot or the energy FIFO, so a
- * snapshot request stops the energy stream.
+ * One 8 KB buffer holds the snapshot, the energy FIFO or the SD write
+ * test's blocks, so starting one stops the energy stream.
  *
  * The audio interrupt fills the buffer and the main loop sends it with
  * CDC_Transmit_FS, which reports busy until the previous transfer has
@@ -42,8 +51,14 @@
 
 #include "main.h"
 #include "pipeline_config.h"
+#include "sd_bench.h"
+#include "sd_spi.h"
 #include "usbd_cdc_if.h"
 #include "../DSP/bat_detect.h"
+#include "../DSP/fft.h"
+#include "../DSP/playback.h"
+#include "../Drivers/adc.h"
+#include "../Drivers/dac.h"
 #include "../Drivers/psram_ring.h"
 
 
@@ -63,6 +78,13 @@
 
 /* 12-bit ADC mid-scale, as in DSP_ProcessBlock */
 #define ADC_MIDSCALE                2048
+
+/* 'W' is followed by three bytes: the SD test's pre-trigger in seconds, its
+ * sectors per write, and 1/0 for DMA or polled. A larger byte isn't a
+ * parameter. */
+#define DEBUG_SD_BENCH_MAX_PRETRIGGER_S     15U
+#define DEBUG_SD_BENCH_PARAMS               3U
+#define DEBUG_SD_BENCH_PARAM_MAX            16U
 
 
 typedef struct
@@ -114,7 +136,16 @@ typedef union
 {
     uint16_t            samples[DEBUG_SNAPSHOT_SAMPLES];
     DebugEnergyRecord_t records[DEBUG_ENERGY_RECORDS];
+    struct
+    {
+        uint16_t raw[FFT_LENGTH];           /* one FFT frame's ADC codes, in order */
+        float    magnitude[FFT_NUM_BINS];   /* FFT_Process's result for it, bins 0-1 included */
+    } fft;
 } DebugCaptureBuffer_t;
+
+/* the FFT capture mustn't make the buffer any bigger */
+_Static_assert(sizeof(((DebugCaptureBuffer_t *)0)->fft) <= sizeof(((DebugCaptureBuffer_t *)0)->samples),
+        "FFT capture doesn't fit the snapshot buffer");
 
 typedef enum
 {
@@ -122,7 +153,9 @@ typedef enum
     DEBUG_MODE_SNAPSHOT,        /* the interrupt is filling the snapshot */
     DEBUG_MODE_SNAPSHOT_READY,  /* full; the main loop sends it */
     DEBUG_MODE_ENERGY,          /* the interrupt adds an energy record per block */
-    DEBUG_MODE_READBACK         /* the PSRAM ring is reading the snapshot back */
+    DEBUG_MODE_READBACK,        /* the PSRAM ring is reading the snapshot back */
+    DEBUG_MODE_SD_BENCH,        /* the SD write test has the buffer */
+    DEBUG_MODE_FFT_CAPTURE      /* the FFT is capturing a frame and its result */
 } DebugMode_t;
 
 typedef enum
@@ -165,6 +198,81 @@ static uint16_t txSequence = 0;
 static uint32_t txRecords = 0;                  /* energy records in the frame being sent */
 static uint32_t readbackNext = 0;               /* next snapshot block to ask the ring for */
 static volatile uint8_t readbackDone[DEBUG_SNAPSHOT_BLOCKS];
+static uint8_t pendingCommand = 0;              /* a command collecting its parameter bytes */
+static uint8_t pendingCount = 0;
+static uint8_t pendingParams[DEBUG_SD_BENCH_PARAMS];
+
+
+/*
+ * Timing and health counters, sent by 'N' (this table, from flash) and 'T'
+ * (the values). The names match the variables, as Live Expressions shows
+ * them. Add an entry here and Tools/capture.py stats picks it up.
+ */
+typedef struct
+{
+    char name[27];
+    char type;                      /* 'u' uint32_t, 'b' uint8_t, 'f' float */
+    const volatile void *value;
+} DebugStat_t;
+
+_Static_assert(sizeof(DebugStat_t) == 32U, "stat entry must match Tools/capture.py");
+
+static const DebugStat_t debugStats[] =
+{
+    { "SystemCoreClock",        'u', &SystemCoreClock },
+    { "blockCount",             'u', &blockCount },             /* audio blocks since reset */
+
+    /* Audio interrupt (adc.c): worst-case DSP_ProcessBlock */
+    { "dspCyclesMax",           'u', &dspCyclesMax },
+    { "dspLoadMaxPercent",      'u', &dspLoadMaxPercent },
+    { "dacLateBlocks",          'u', &dacLateBlocks },
+
+    /* Main loop: FFT_Process */
+    { "fftProcessCyclesAvg",    'u', &fftProcessCyclesAvg },
+    { "fftProcessCyclesMax",    'u', &fftProcessCyclesMax },
+    { "fftDroppedBlocks",       'u', &fftDroppedBlocks },
+
+    /* PSRAM ring */
+    { "psramRingBlocks",        'u', &psramRingBlocks },
+    { "psramRingReads",         'u', &psramRingReads },
+    { "psramRingBursts",        'u', &psramRingBursts },
+    { "psramRingMaxSelectNs",   'u', &psramRingMaxSelectNs },
+    { "psramRingMinSelectNs",   'u', &psramRingMinSelectNs },
+    { "psramRingMaxEntryNs",    'u', &psramRingMaxEntryNs },
+    { "psramRingMaxIsrNs",      'u', &psramRingMaxIsrNs },
+    { "psramRingOverTcem",      'u', &psramRingOverTcem },
+    { "psramRingLateBlocks",    'u', &psramRingLateBlocks },
+    { "psramRingFaults",        'u', &psramRingFaults },
+
+    /* Playback */
+    { "playbackUnderruns",      'u', &playbackUnderruns },
+
+    /* SD card driver (sd_spi.h) */
+    { "sdErrorCount",           'u', &sdErrorCount },
+    { "sdLastError",            'u', &sdLastError },
+    { "sdLastCardStatus",       'u', &sdLastCardStatus },
+    { "sdLateResponse",         'u', &sdLateResponse },
+    { "sdBusyMaxUs",            'u', &sdBusyMaxUs },
+    { "sdHalFailures",          'u', &sdHalFailures },
+    { "sdHalFailure",           'u', &sdHalFailure },
+    { "sdStaleRx",              'u', &sdStaleRx },
+    { "sdStaleRxFirst",         'u', &sdStaleRxFirst },
+    { "sdUseDma",               'b', &sdUseDma },
+    { "sdRecoveries",           'u', &sdRecoveries },
+    { "sdRecoveryFailures",     'u', &sdRecoveryFailures },
+
+    /* Bat detector */
+    { "batEnergyDb",            'f', &batEnergyDb },
+    { "batFloorDb",             'f', &batFloorDb },
+    { "batPulses",              'u', &batPulses },
+    { "batTriggers",            'u', &batTriggers },
+    { "batNoiseRuns",           'u', &batNoiseRuns },
+    { "batPresent",             'b', &batPresent },
+};
+
+#define DEBUG_STAT_COUNT    (sizeof(debugStats) / sizeof(debugStats[0]))
+
+static uint32_t statValues[DEBUG_STAT_COUNT];  /* the 'T' payload */
 
 
 
@@ -341,6 +449,15 @@ static void DebugLink_FrameSent(void)
 
         energyRead = read;
     }
+    else if(txHeader.type == 'W')
+    {
+        SdBench_ReleaseResult();        /* the SD test hands the buffer back */
+        mode = DEBUG_MODE_IDLE;
+    }
+    else if((txHeader.type == 'F') && (mode == DEBUG_MODE_FFT_CAPTURE))
+    {
+        mode = DEBUG_MODE_IDLE;
+    }
 }
 
 
@@ -459,9 +576,93 @@ static void DebugLink_ContinueReadback(void)
 }
 
 
+/* Copy the stats' current values into the 'T' payload */
+static void DebugLink_SnapshotStats(void)
+{
+    for(uint32_t i = 0; i < DEBUG_STAT_COUNT; i++)
+    {
+        const volatile void *value = debugStats[i].value;
+
+        if(debugStats[i].type == 'b')
+        {
+            statValues[i] = *(const volatile uint8_t *)value;
+        }
+        else if(debugStats[i].type == 'f')
+        {
+            const float number = *(const volatile float *)value;
+
+            memcpy(&statValues[i], &number, sizeof(statValues[i]));
+        }
+        else
+        {
+            statValues[i] = *(const volatile uint32_t *)value;
+        }
+    }
+}
+
+
+/* Restart the worst-case timings, so the next reading covers only what follows */
+static void DebugLink_ResetTimings(void)
+{
+    const uint32_t primask = __get_PRIMASK();
+
+    __disable_irq();
+
+    /* the audio interrupt updates these two together */
+    dspCyclesMax = 0U;
+    dspLoadMaxPercent = 0U;
+
+    __set_PRIMASK(primask);
+
+    fftProcessCyclesMax = 0U;       /* main loop, like this */
+    sdBusyMaxUs = 0U;
+    psramRingResetStats = 1U;       /* the ring's interrupt clears its own on the next burst */
+}
+
+
+static void DebugLink_StartSdBench(uint8_t pretriggerSeconds, uint8_t sectorsPerWrite, uint8_t useDma)
+{
+    /* takes the buffer, so it stops an energy stream; not while a snapshot or read-back has it */
+    if((mode != DEBUG_MODE_IDLE) && (mode != DEBUG_MODE_ENERGY))
+    {
+        return;
+    }
+
+    if(pretriggerSeconds > DEBUG_SD_BENCH_MAX_PRETRIGGER_S)
+    {
+        pretriggerSeconds = DEBUG_SD_BENCH_MAX_PRETRIGGER_S;
+    }
+
+    mode = DEBUG_MODE_SD_BENCH;
+
+    /* an invalid sectors-per-write comes back as an error result */
+    SdBench_Start(&captureBuffer, sizeof(captureBuffer),
+            ((uint32_t)pretriggerSeconds * AUDIO_SAMPLE_RATE_HZ) / AUDIO_BLOCK_SIZE, sectorsPerWrite,
+            useDma != 0U);
+}
+
+
 static void DebugLink_HandleCommand(uint8_t command)
 {
     uint32_t primask;
+
+    if(pendingCommand == 'W')
+    {
+        if(command <= DEBUG_SD_BENCH_PARAM_MAX)
+        {
+            pendingParams[pendingCount++] = command;
+
+            if(pendingCount == DEBUG_SD_BENCH_PARAMS)
+            {
+                pendingCommand = 0U;
+                DebugLink_StartSdBench(pendingParams[0], pendingParams[1], pendingParams[2]);
+            }
+            return;
+        }
+
+        /* not a parameter (e.g. an 'S' after a lone 'W'): a command of its own */
+        pendingCommand = 0U;
+    }
 
     switch(command)
     {
@@ -487,6 +688,11 @@ static void DebugLink_HandleCommand(uint8_t command)
         break;
 
     case 'E':
+        if((mode == DEBUG_MODE_SD_BENCH) || (mode == DEBUG_MODE_FFT_CAPTURE))
+        {
+            break;      /* the buffer is taken */
+        }
+
         primask = __get_PRIMASK();
         __disable_irq();
 
@@ -499,7 +705,42 @@ static void DebugLink_HandleCommand(uint8_t command)
         break;
 
     case 'S':
-        mode = DEBUG_MODE_IDLE;
+        if(mode == DEBUG_MODE_SD_BENCH)
+        {
+            SdBench_Stop();     /* keeps the buffer until its result has been sent */
+        }
+        else
+        {
+            FFT_CancelCapture();
+            mode = DEBUG_MODE_IDLE;
+        }
+        break;
+
+    case 'F':
+        /* takes the buffer, so it stops an energy stream like 'R' does */
+        if((mode == DEBUG_MODE_IDLE) || (mode == DEBUG_MODE_ENERGY))
+        {
+            mode = DEBUG_MODE_FFT_CAPTURE;
+            FFT_RequestCapture(captureBuffer.fft.raw, captureBuffer.fft.magnitude);
+        }
+        break;
+
+    case 'W':
+        pendingCommand = 'W';   /* the next two bytes are its parameters */
+        pendingCount = 0U;
+        break;
+
+    case 'N':
+        DebugLink_StartFrame('N', debugStats, sizeof(debugStats), DEBUG_STAT_COUNT, sizeof(DebugStat_t));
+        break;
+
+    case 'T':
+        DebugLink_SnapshotStats();
+        DebugLink_StartFrame('T', statValues, sizeof(statValues), DEBUG_STAT_COUNT, HAL_GetTick());
+        break;
+
+    case 'Z':
+        DebugLink_ResetTimings();
         break;
 
     case 'M':
@@ -523,9 +764,26 @@ static void DebugLink_HandleCommand(uint8_t command)
 
 static void DebugLink_Reset(void)
 {
-    mode = DEBUG_MODE_IDLE;
+    if(mode == DEBUG_MODE_SD_BENCH)
+    {
+        /* the SD test keeps the buffer until it has closed its file */
+        SdBench_Stop();
+
+        if(SdBench_GetResult() != NULL)
+        {
+            SdBench_ReleaseResult();
+            mode = DEBUG_MODE_IDLE;
+        }
+    }
+    else
+    {
+        FFT_CancelCapture();
+        mode = DEBUG_MODE_IDLE;
+    }
+
     txStage = TX_IDLE;
     commandTail = commandHead;
+    pendingCommand = 0U;
 }
 
 
@@ -562,6 +820,14 @@ void DebugLink_Poll(void)
             else if(mode == DEBUG_MODE_READBACK)
             {
                 DebugLink_ContinueReadback();
+            }
+            else if((mode == DEBUG_MODE_SD_BENCH) && (SdBench_GetResult() != NULL))
+            {
+                DebugLink_StartFrame('W', SdBench_GetResult(), sizeof(SdBench_Result_t), 0U, 0U);
+            }
+            else if((mode == DEBUG_MODE_FFT_CAPTURE) && FFT_CaptureDone())
+            {
+                DebugLink_StartFrame('F', &captureBuffer.fft, sizeof(captureBuffer.fft), FFT_LENGTH, FFT_NUM_BINS);
             }
         }
     }

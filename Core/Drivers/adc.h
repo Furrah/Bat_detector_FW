@@ -31,6 +31,12 @@ void ADC_SetHalfBufferCallback(ADC_Callback_t callback);
 void ADC_SetFullBufferCallback(ADC_Callback_t callback);
 
 
+/* Worst-case block callback (DSP_ProcessBlock) time, in cycles and as a %
+ * of one block period. The debug link reports them and can reset them. */
+extern volatile uint32_t dspCyclesMax;
+extern volatile uint32_t dspLoadMaxPercent;
+
+
 /*
  * ADC2 scans the slow analogue inputs, one DMA transfer per scan.
  * The order must match the CubeMX ADC2 regular ranks.

@@ -21,9 +21,19 @@
 
 #include "fft.h"
 #include <math.h>
+#include <string.h>
 
 #include "main.h"
 #include "Tables/dsp_tables.h"
+
+/*
+ * This file builds at -O2 whatever the project setting (-Og in Debug), as
+ * psram_ring.c does. FFT_Process ran 2.34 ms per frame at -Og (398k cycles,
+ * interrupts included), long enough that the FFT dropped 2 of every 6 audio
+ * blocks. FFT_AddSamples runs in the audio interrupt, so it gains too.
+ * No -ffast-math: the arithmetic stays IEEE.
+ */
+#pragma GCC optimize ("O2")
 
 #define CFFT_LEN    512U     // = FFT_LENGTH / 2
 #define CFFT_LOG2   9U       // log2(CFFT_LEN)
@@ -54,23 +64,34 @@ volatile uint32_t fftDroppedBlocks  = 0;
 volatile uint32_t fftProcessCyclesAvg = 0;
 volatile uint32_t fftProcessCyclesMax = 0;
 
+/* Debug capture (FFT_RequestCapture). The audio interrupt arms it at the
+ * start of a frame and copies that frame's codes; FFT_Process copies the
+ * result. Frames are processed in order, so the next one processed is it. */
+typedef enum
+{
+    FFT_CAPTURE_IDLE = 0,
+    FFT_CAPTURE_REQUESTED,      /* waiting for a frame to start */
+    FFT_CAPTURE_FILLING,        /* copying this frame's codes */
+    FFT_CAPTURE_FULL,           /* frame complete, waiting for FFT_Process */
+    FFT_CAPTURE_DONE
+} FftCaptureState_t;
+
+static volatile uint8_t captureState = FFT_CAPTURE_IDLE;
+static uint16_t *captureRaw;
+static float *captureMagnitude;
 
 
 
 
 
 
+
+/* Reverse the low `bits` bits of x (x < 2^bits). RBIT reverses all 32 bits
+ * in one instruction; the shift keeps the top `bits`. Replaces a 9-pass
+ * loop run for each of the 512 indices. */
 static uint32_t BitReverse(uint32_t x, uint32_t bits)
 {
-    uint32_t result = 0;
-
-    for(uint32_t i = 0; i < bits; i++)
-    {
-        result = (result << 1) | (x & 1U);
-        x >>= 1;
-    }
-
-    return result;
+    return __RBIT(x) >> (32U - bits);
 }
 
 
@@ -150,6 +171,24 @@ void FFT_AddSamples(const uint16_t *input, uint32_t length)
         return;
     }
 
+    // Debug capture: start with a frame, then keep its raw codes
+    if((captureState == FFT_CAPTURE_REQUESTED) && (fftFillIndex == 0U))
+    {
+        captureState = FFT_CAPTURE_FILLING;
+    }
+
+    if((captureState == FFT_CAPTURE_FILLING) && (fftFillIndex < FFT_LENGTH))
+    {
+        uint32_t count = FFT_LENGTH - fftFillIndex;
+
+        if(count > length)
+        {
+            count = length;
+        }
+
+        memcpy(&captureRaw[fftFillIndex], input, count * sizeof(uint16_t));
+    }
+
     for(uint32_t i = 0; i < length; i++)
     {
         if(fftFillIndex >= FFT_LENGTH)
@@ -187,8 +226,33 @@ void FFT_AddSamples(const uint16_t *input, uint32_t length)
 
     if(fftFillIndex >= FFT_LENGTH)
     {
+        if(captureState == FFT_CAPTURE_FILLING)
+        {
+            captureState = FFT_CAPTURE_FULL;
+        }
+
         fftBufferFull = 1;
     }
+}
+
+
+void FFT_RequestCapture(uint16_t *raw, float *magnitude)
+{
+    captureRaw = raw;
+    captureMagnitude = magnitude;
+    captureState = FFT_CAPTURE_REQUESTED;   // last: the interrupt acts on it
+}
+
+
+uint8_t FFT_CaptureDone(void)
+{
+    return captureState == FFT_CAPTURE_DONE;
+}
+
+
+void FFT_CancelCapture(void)
+{
+    captureState = FFT_CAPTURE_IDLE;
 }
 
 
@@ -239,6 +303,13 @@ void FFT_Process(void)
         }
     }
 
+
+    // Debug capture: this is the captured frame's result, all bins
+    if(captureState == FFT_CAPTURE_FULL)
+    {
+        memcpy(captureMagnitude, fftMagnitude, sizeof(fftMagnitude));
+        captureState = FFT_CAPTURE_DONE;
+    }
 
     //TODO This is a big of a hack to remove the DC component from the waterfall plot..
     fftMagnitude[0] = 0.0f;

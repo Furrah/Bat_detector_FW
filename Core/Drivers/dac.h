@@ -33,4 +33,8 @@ void DAC_WriteBlock(
         uint32_t length);
 
 
+/* Blocks that collided with the DMA; should stay 0 */
+extern volatile uint32_t dacLateBlocks;
+
+
 #endif /* DRIVERS_DAC_H_ */
