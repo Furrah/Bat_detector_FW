@@ -519,6 +519,43 @@ Entries are in order, with the newest at the bottom. Decisions that are agreed b
 
 ---
 
+## 2026-11-02: SD card bring-up
+
+### 38. SD card: FAT32 on SDHC up to 32 GB; single-sector headroom too thin to rely on (Nov 2)
+- **Decision:**
+  - SD cards are FAT32 on SDHC cards of 32 GB or less, with an MBR partition table, formatted with the SD Association's SD Card Formatter. FatFS stays built without exFAT.
+  - The SD recorder's write size is chosen from a sustained write test under recording load, not from the boot speed test. At boot, with nothing else running, single-sector writes (CMD24) give 1.33× headroom over 500 kB/s, which is too thin to rely on.
+- **Context:** The first card, a 16 GB SDHC, arrived for bring-up of the driver written on Oct 30: `sd_spi.c` under FatFS R0.12c, with `_FS_TINY` on, LFN off, exFAT off and `_MULTI_PARTITION` 0.
+- **Why this format (with numbers):**
+  - **No exFAT.** Every card over 32 GB (SDXC) ships as exFAT, and SD Card Formatter reformats it as exFAT because the SD spec says to. Turning exFAT on in R0.12c needs LFN as well: with `_USE_LFN 1` that's 512 B of LFN buffer plus 608 B of directory buffer, about 1.1 KB of the 1.7 KB of RAM left, plus a few KB of flash (estimated, not measured). Shipping exFAT in a product may also need a licence from Microsoft.
+  - **32 GB is enough.** At 500 kB/s a 32 GB card holds 17.7 h, and this 16 GB card 8.7 h. FAT32's 4 GiB file limit is 2.4 h per file, the same limit as a WAV's 32-bit RIFF size field.
+  - **MBR, one partition.** With `_MULTI_PARTITION` 0, FatFS mounts the first FAT partition in the MBR. R0.12c can't read GPT (that arrived in R0.14). A card with several partitions, such as one from a Raspberry Pi, would mount its small boot partition.
+  - **SD Card Formatter rather than Windows.** It follows the SD File System Specification: 32 KB clusters on SDHC, with the data area aligned to the card's 4 MB allocation unit. Windows uses 16 KB clusters on 16–32 GB cards (8 KB on 8–16 GB) and doesn't align the data area. Speed Class figures assume the spec layout. With 32 KB clusters one FAT32 sector maps 4 MB, about 8 s of recording, so FAT updates are half as frequent as with 16 KB.
+- **Measured (16 GB SDHC):**
+  - **Boot screen:** "SD SDHC 14912MB" (30,539,776 sectors). That line only appears once the card's start-up commands (CMD0, CMD8, ACMD41, then CMD58 with the CCS bit set), the CSD read and FatFS's mount have all succeeded.
+  - **Speed test** (hold PLAYBACK at power-up; it runs before the audio starts): W666 R648 kB/s, and the readback matches the pattern.
+  - **PC check:** Windows reads `SDTEST.BIN` as 262,144 bytes, all matching the pattern (checked with numpy).
+- **Why the boot speed test doesn't settle the recorder's write size:**
+  - The test writes in 64-byte `f_write` calls. With `_FS_TINY` these reach the driver one sector at a time, so the card only ever sees CMD24 and CMD17.
+  - 666 kB/s is 0.75 ms per sector, while the data takes 0.19 ms on the wire at 21.25 MHz (SPI2: 85 MHz / 4). The other ~0.56 ms is the card's wait after each command, the command bytes sent one at a time through HAL, FatFS's per-call cost and the test's own pattern loop. These haven't been measured separately yet.
+  - Recording needs 500 kB/s, so the headroom is 1.33×, measured with nothing else running. Recording is harder in three ways:
+    - **CPU:** the DSP and ring interrupts take 45% of the CPU while the ring writes, and 66% while it's also read back to back. The SD writer reads every block back out of the ring, so recording sits in that range. The FFT and waterfall also run in the main loop and take whatever time is left.
+    - **SPI2:** the waterfall draws on the same bus as the card.
+    - **Stalls:** the test writes for 0.4 s, too short to catch the 100–250 ms stalls cards produce now and then. A 250 ms stall leaves a 125 KB backlog. The PSRAM holds it, but at 166 kB/s of spare rate it takes 0.75 s to clear, and only while the average rate stays above 500 kB/s.
+  - CPU load slows the CPU part of each sector but not the card's waits. If all the overhead is card waiting, recording would still see about 666 kB/s; if it's all CPU time, about 230–370 kB/s at 45–66% load. 500 kB/s falls inside that range, so this test can't predict the outcome.
+  - The driver already has CMD25 (with the ACMD23 pre-erase hint) and CMD18, but neither has run yet.
+- **Alternatives considered:**
+  - **exFAT:** see above.
+  - **FAT32 on a 64 GB+ card** with a third-party formatter. FatFS handles FAT32 up to 2 TB, but it's outside the SD spec for SDXC, and the alignment is lost unless the tool aligns the data area itself.
+  - **Formatting with Windows:** smaller clusters, no alignment.
+  - **Going straight to a multi-sector pass in the boot test:** it changes two things at once (the transfer size and untested driver code) and still says nothing about recording load.
+- **Outcome:** SD bring-up passes: mount, single-sector write and read, and an independent check on the PC. Next: a sustained single-sector write test under recording load, about 60 s with the audio, ring and waterfall running. If the average is well clear of 500 kB/s and the stalls fit in the PSRAM, the first recorder uses single-sector writes. If not, a multi-sector pass comes next.
+- **Lessons for future designs:**
+  - Check a storage self-test with an independent reader. A readback through the same driver passes even when a consistent addressing bug puts the data in the wrong place.
+  - Make a speed test match the real workload: transfer size, CPU load, bus sharing and duration. Otherwise, say what it leaves out. This one measures the slowest transfer size in the easiest conditions.
+
+---
+
 ## Planned decisions (agreed, not built yet)
 
 ### P1. Reclaim about 8 KB of RAM: built, see entries 26–29.
@@ -592,6 +629,8 @@ Entries are in order, with the newest at the bottom. Decisions that are agreed b
 - On a Cortex-M4, put hot code in core-coupled RAM if the part has it: ordinary SRAM shares the bus between code and data (entry 36).
 - Check the disassembly before blaming a function (entry 36).
 - Choose a time-expansion factor from the whole output chain's passband, not just a target pitch (entry 37).
+- Check a storage self-test with an independent reader: a readback through the same driver can't catch a consistent addressing bug (entry 38).
+- Make a speed test match the real workload (transfer size, CPU load, bus sharing, duration), or say what it leaves out (entry 38).
 
 ---
 

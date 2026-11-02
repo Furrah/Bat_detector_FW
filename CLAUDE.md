@@ -111,10 +111,12 @@ Unused: PA7, PA10, PA15, PB1, PB9, PC13.
   - Linear interpolation at the full 250 kHz DAC rate, after the same 10 kHz high-pass as the heterodyne. Replaces the heterodyne output while active (`DSP_ProcessBlock`); detector and waterfall stay live.
   - The ring is paused during playback and resumes when it ends. Two 512-byte slots: one plays while the next block loads.
   - Live Expressions: `playbackUnderruns` (should stay 0). The display shows "PLAY 10x  20s" in place of the LO readout.
-- `sd_spi.c` (FATFS/Target): SPI-mode SD driver on SPI2. FatFS is wired up through `user_diskio.c` with `_FS_TINY` on, LFN off and exFAT off, so cards must be FAT32.
+- `sd_spi.c` (FATFS/Target): SPI-mode SD driver on SPI2, verified on hardware 2026-11-02 with a 16 GB SDHC card (diary 38). FatFS R0.12c is wired up through `user_diskio.c` with `_FS_TINY` on, LFN off and exFAT off.
+  - Cards: FAT32 (FAT12/16 also mount) on an MBR partition table, SDHC of 32 GB or less. Format with the SD Association's SD Card Formatter (32 KB clusters, 4 MB-aligned), not Windows. exFAT, which every card over 32 GB ships with, doesn't mount: the boot screen shows "SD: not FAT32".
+  - Only single-sector transfers have run so far. The CMD25/CMD18 multi-sector paths are untested.
 - Boot checks run before the audio starts:
   - PSRAM: hold RECORD at power-up for the full 8 MB test (~35 s).
-  - SD: hold PLAYBACK at power-up for a 256 KB write/read speed test.
+  - SD: hold PLAYBACK at power-up for a 256 KB write/read speed test. It leaves `SDTEST.BIN` on the card. Measured W666 R648 kB/s; its 64-byte `f_write` calls make every transfer single-sector.
 - V2 port, still to do:
   - Disconnect TIM3 (V1's LO). Keep `tim3_lo.c/.h` in the project; the technique is in `Docs/timer_waveform_output.md`.
   - `ili9341_touch.*` is V1-only: it hardcodes `hspi1`, PB4 and PA10, which are now the PSRAM bus. Its include and call are disconnected; keep the files.
@@ -152,14 +154,15 @@ Bugs already fixed — do not reintroduce:
 - V2 order:
   1. V1 features running on V2. Done.
   2. PSRAM bring-up. Done; the full 8 MB test is still to run once.
-  3. SD bring-up. Driver written; no card available yet (Oct 30).
+  3. SD bring-up. Done (Nov 2): mount, write and read verified, including a PC check of `SDTEST.BIN`. Next: a sustained write test under recording load.
   4. RAM reclaim (done Oct 30), then the DMA-driven PSRAM ring buffer (verified Oct 30), then WAV recording to SD.
   5. Time-expansion playback from PSRAM on PLAYBACK. Version 1 built (fixed 10×, last 2 s). Next: start at the detector's last bat pass; a knob-set factor.
 - Amplifier gating ("squelch"): switch `AMP_EN` on only while bats are detected.
   - Stage 1 (the monitor-only detector) is built; tune it in the field first.
   - Stage 2: drive `AMP_EN` from it, with a fade, amp off at zero volume, and forced on during playback.
   - The squelch-off (always-on) control is deferred.
-- Recording architecture: SD writes can stall 100–250 ms (up to ~96 KB at 384 kB/s), so PSRAM writes must be driven from the ADC ISR side. One ISR-driven SPI1 engine owns the PSRAM; the SD writer and the playback prefetch queue read requests to it.
+- Recording architecture: SD writes can stall 100–250 ms (up to 125 KB at 500 kB/s), so PSRAM writes must be driven from the ADC ISR side. One ISR-driven SPI1 engine owns the PSRAM; the SD writer and the playback prefetch queue read requests to it.
+  - Single-sector writes measured 666 kB/s at boot with nothing else running: 1.33× headroom, too thin to rely on. Choose the writer's transfer size from a sustained test under recording load (DSP and ring interrupts at 45–66%, FFT and waterfall in the main loop, display sharing SPI2), not from the boot test (diary 38).
 - Finish the DSP chain: bandpass around the 1–2 kHz output, float throughout to avoid inter-stage truncation, and wire in the notch filter. It is initialised in `DSP_Init` but not connected in `DSP_ProcessBlock`, and `dsp_filters.h` hasn't been reviewed yet.
 - Time-expansion mode: capture a detected call from PSRAM and play it back slowed down. The record button writes the PSRAM pre-trigger data to SD, followed by the live stream.
 - WAV header formatting compatible with bat-ID software.
