@@ -33,12 +33,12 @@ import argparse
 import struct
 import sys
 import time
-import zlib
 from pathlib import Path
 
 import numpy as np
-import serial
-import serial.tools.list_ports
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))     # -I leaves the script's folder off the path
+from diaglink import FrameReader, LinkError, find_port, open_port, read_stat_table, read_stats  # noqa: E402
 
 
 # USB IDs of the board's virtual COM port (USB_Device/App/usbd_desc.c)
@@ -48,8 +48,6 @@ USB_PID = 0x5740
 PROTOCOL_VERSION = 1
 MAGIC = b"BATD"
 
-# DebugFrameHeader_t: magic, type, version, sequence, length, arg0, arg1
-HEADER = struct.Struct("<4sBBHIII")
 
 # DebugInfo_t
 INFO = struct.Struct("<IHHHHI24s")
@@ -65,8 +63,6 @@ ENERGY_DTYPE = np.dtype([
     ("flags", "u1"),
 ])
 
-# DebugStat_t: name, type ('u' uint32, 'b' uint8, 'f' float), pointer (ignored)
-STAT_ENTRY = struct.Struct("<27scI")
 
 # Counters that must stay 0, and limits (CLAUDE.md)
 STATS_MUST_BE_ZERO = {"dacLateBlocks", "psramRingOverTcem", "psramRingLateBlocks", "sdErrorCount",
@@ -160,118 +156,7 @@ def describe_late_response(value):
     else:
         meaning = "not a data response"
     return f"card answered {count} byte(s) late with 0x{reply:02X}: {meaning}"
-MAX_PAYLOAD = 65536
 CAPTURE_DIR = Path(__file__).resolve().parent.parent / "Captures"
-
-
-class Frame:
-    def __init__(self, kind, sequence, arg0, arg1, payload):
-        self.kind = kind
-        self.sequence = sequence
-        self.arg0 = arg0
-        self.arg1 = arg1
-        self.payload = payload
-
-
-class FrameReader:
-    """Splits the byte stream into frames, resyncing on bad data."""
-
-    def __init__(self, port):
-        self.port = port
-        self.buffer = bytearray()
-        self.crc_errors = 0
-        self.skipped_bytes = 0
-        self.lost_frames = 0
-        self.last_sequence = None
-
-    def read_frame(self, timeout):
-        deadline = time.monotonic() + timeout
-
-        while True:
-            frame = self._parse()
-            if frame is not None:
-                return frame
-            if time.monotonic() > deadline:
-                return None
-            self.buffer += self.port.read(max(1, self.port.in_waiting))
-
-    def _parse(self):
-        while True:
-            start = self.buffer.find(MAGIC)
-
-            if start < 0:
-                # keep a few bytes in case the magic is split across reads
-                drop = max(0, len(self.buffer) - (len(MAGIC) - 1))
-                self.skipped_bytes += drop
-                del self.buffer[:drop]
-                return None
-
-            if start > 0:
-                self.skipped_bytes += start
-                del self.buffer[:start]
-
-            if len(self.buffer) < HEADER.size:
-                return None
-
-            _, kind, version, sequence, length, arg0, arg1 = HEADER.unpack_from(self.buffer)
-
-            if version != PROTOCOL_VERSION or length > MAX_PAYLOAD:
-                self.skipped_bytes += 1
-                del self.buffer[:1]
-                continue
-
-            end = HEADER.size + length
-            if len(self.buffer) < end + 4:
-                return None
-
-            (crc,) = struct.unpack_from("<I", self.buffer, end)
-
-            if zlib.crc32(self.buffer[:end]) != crc:
-                self.crc_errors += 1
-                del self.buffer[:1]
-                continue
-
-            payload = bytes(self.buffer[HEADER.size:end])
-            del self.buffer[:end + 4]
-
-            if self.last_sequence is not None:
-                self.lost_frames += (sequence - self.last_sequence - 1) & 0xFFFF
-            self.last_sequence = sequence
-
-            return Frame(chr(kind), sequence, arg0, arg1, payload)
-
-    def wait_for(self, kind, timeout):
-        """Return the next frame of this kind, skipping others."""
-        deadline = time.monotonic() + timeout
-
-        while True:
-            frame = self.read_frame(max(0.0, deadline - time.monotonic()))
-            if frame is None:
-                return None
-            if frame.kind == kind:
-                return frame
-
-
-def find_port():
-    for port in serial.tools.list_ports.comports():
-        if port.vid == USB_VID and port.pid == USB_PID:
-            return port.device
-    sys.exit("Bat detector not found: is the USB-C cable in (the working way round)?")
-
-
-def open_board(port_name):
-    """Open the port, stop any stream and throw away whatever was queued."""
-    port = serial.Serial(port_name, timeout=0.05)   # USB CDC ignores the baud rate
-    port.write(b"S")
-
-    deadline = time.monotonic() + 3.0
-    quiet_since = time.monotonic()
-
-    while time.monotonic() - quiet_since < 0.3 and time.monotonic() < deadline:
-        if port.read(4096):
-            quiet_since = time.monotonic()
-
-    return port
 
 
 def read_info(reader):
@@ -469,40 +354,6 @@ def percent(fraction):
     return "n/a" if fraction != fraction else f"{fraction:.0%}"
 
 
-def read_stat_table(reader):
-    """Names and types of the board's timing and health counters ('N')."""
-    reader.port.write(b"N")
-    frame = reader.wait_for("N", timeout=2.0)
-
-    if frame is None:
-        sys.exit("No reply to the stats request: is the board running firmware with the stats table?")
-    if frame.arg1 != STAT_ENTRY.size:
-        sys.exit(f"Stat entries are {frame.arg1} bytes on the board, {STAT_ENTRY.size} here: update STAT_ENTRY")
-
-    table = []
-    for i in range(frame.arg0):
-        name, kind, _ = STAT_ENTRY.unpack_from(frame.payload, i * STAT_ENTRY.size)
-        table.append((name.split(b"\0")[0].decode("ascii"), kind.decode("ascii")))
-    return table
-
-
-def read_stats(reader, table):
-    """Current values ('T'), as {name: value}, and the board's uptime in ms."""
-    reader.port.write(b"T")
-    frame = reader.wait_for("T", timeout=2.0)
-
-    if frame is None:
-        sys.exit("No reply to the stats read")
-    if frame.arg0 != len(table):
-        sys.exit("The board's stats table doesn't match the names it sent")
-
-    values = {}
-    for i, (name, kind) in enumerate(table):
-        raw = frame.payload[4 * i:4 * i + 4]
-        values[name] = struct.unpack("<f", raw)[0] if kind == "f" else struct.unpack("<I", raw)[0]
-    return values, frame.arg1
-
-
 def check_stat(name, value):
     if name in STATS_MUST_BE_ZERO and value != 0:
         return "<-- must stay 0"
@@ -582,11 +433,13 @@ def main():
                         help="stats: restart the worst-case timings, wait this long, then read")
     args = parser.parse_args()
 
-    port_name = args.port or find_port()
+    port_name = args.port or find_port(USB_VID, USB_PID)
+    if port_name is None:
+        sys.exit("Bat detector not found: is the USB-C cable in (the working way round)?")
     print(f"Board on {port_name}")
 
-    with open_board(port_name) as port:
-        reader = FrameReader(port)
+    with open_port(port_name) as port:
+        reader = FrameReader(port, MAGIC, PROTOCOL_VERSION)
         info = read_info(reader)
         print_info(info)
 
@@ -602,12 +455,15 @@ def main():
             sys.exit(0 if passed else 1)
 
         if args.command == "stats":
-            table = read_stat_table(reader)
-            if args.window > 0:
-                port.write(b"Z")
-                print(f"Worst-case timings restarted; measuring for {args.window:.0f} s")
-                time.sleep(args.window)
-            values, uptime_ms = read_stats(reader, table)
+            try:
+                table = read_stat_table(reader)
+                if args.window > 0:
+                    port.write(b"Z")
+                    print(f"Worst-case timings restarted; measuring for {args.window:.0f} s")
+                    time.sleep(args.window)
+                values, uptime_ms = read_stats(reader, table)
+            except LinkError as error:
+                sys.exit(f"Stats: {error}")
             print_stats(values, uptime_ms, info)
             return
 

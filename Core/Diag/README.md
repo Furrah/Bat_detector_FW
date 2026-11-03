@@ -17,7 +17,25 @@ The DWT cycle counter exists on Cortex-M3, M4, M7 and M33 parts, but not on M0/M
 | `diag_port.h` | The device header, and `DIAG_INLINE`: helpers that always compile into their caller, so they're safe in interrupts that run from RAM. |
 | `diag_cycles.h` | Timing with the DWT cycle counter: start it, read it, convert cycles to µs or ns, and keep a worst case, best case or running average. |
 | `diag_error.h` | Failure records: a count, plus the details of the first failure packed into one word (`DIAG_PACK4`). One word shows whole in a watch window or a stats readout. |
+| `diag_stats.h/.c` | A table of named counters (`DIAG_STAT_U32(var)` and so on) for a PC to read: a debugger's watch window, without the debugger. |
+| `diag_link.h/.c` | A framed command link over any byte transport (send and connected functions you supply). It has a 20-byte header, a CRC-32 (`zlib.crc32` on the PC), a command queue fed from the receive interrupt, and frames sent in place. `N`, `T` and `Z` serve the stats table; you add your own commands and frames. `Tools/diaglink.py` is the PC side. |
 | `diag_spi.h/.c` | Start-up checks that read the registers CubeMX actually set: an SPI's frame size and NSS pulse mode, pins slower than a given speed, and an interrupt alone at the top priority. Plus a receive-FIFO drain for drivers that mix register access with HAL calls. |
+
+## The link in another project
+
+1. Write two transport functions: `send` (start a transfer; return 0 while the previous one is still going) and `connected`.
+2. Fill in a `DiagLinkConfig_t`: the magic, a version, the transport functions, your commands, and optionally a stats table and hooks.
+3. Call `DiagLink_Init` once, `DiagLink_OnReceive` from the receive callback, and `DiagLink_Poll` from the main loop.
+4. On the PC:
+
+   ```python
+   from diaglink import FrameReader, open_port, read_stat_table, read_stats
+
+   reader = FrameReader(open_port("COM8"), magic=b"BATD", version=1)
+   values, uptime_ms = read_stats(reader, read_stat_table(reader))
+   ```
+
+The bat detector's own use is `Core/Src/debug_link.c` (the captures and the USB transport) and `Core/Src/stats_table.c` (its counters).
 
 ## Patterns worth keeping
 
