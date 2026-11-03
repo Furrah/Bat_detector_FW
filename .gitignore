@@ -6,8 +6,6 @@
 .recommenders/
 
 .settings/
-.project
-.cproject
 .classpath
 
 # CubeIDE build configurations
@@ -19,9 +17,9 @@ Release/
 # STM32Cube generated folders
 # ==========================
 
-Drivers/STM32G4xx_HAL_Driver/
-Middlewares/
-USB_DEVICE/
+# The prebuilt CMSIS-DSP libraries (11 MB): nothing links them (CLAUDE.md)
+Middlewares/ST/ARM/DSP/Lib/
+Middlewares/ST/CMSIS/DSP/Lib/
 
 
 # ==========================
