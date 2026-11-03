@@ -23,8 +23,8 @@
  *
  * The frame format is described at the top of debug_link.c.
  *
- * Set DEBUG_CAPTURE to 0 to remove the module and free its 8 KB buffer,
- * which PSRAM/SD recording will need.
+ * Set DEBUG_CAPTURE to 0 to remove the module. Its 8 KB buffer stays,
+ * because the WAV recorder borrows it (below).
  */
 
 #ifndef DEBUG_LINK_H_
@@ -36,6 +36,21 @@
 #ifndef DEBUG_CAPTURE
 #define DEBUG_CAPTURE   1
 #endif
+
+
+/*
+ * The 8 KB buffer behind the snapshot, the energy FIFO, the FFT capture and
+ * the SD test is lent to the WAV recorder (recorder.c) while it records:
+ * there's no RAM for a second one. While it's lent, 'R', 'E', 'M', 'F' and
+ * 'W' are ignored. With DEBUG_CAPTURE 0 the buffer is the recorder's alone.
+ */
+#define DEBUG_LINK_BUFFER_BYTES     8192U
+
+/* Main loop: borrow the buffer (4-byte aligned), or NULL while the debug link is using it */
+void *DebugLink_LendBuffer(void);
+
+/* Main loop: give it back, once nothing (e.g. a PSRAM ring read) still writes into it */
+void DebugLink_ReturnBuffer(void);
 
 
 #if DEBUG_CAPTURE

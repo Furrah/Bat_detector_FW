@@ -33,6 +33,7 @@
 #include "playback.h"
 #include "debug_link.h"
 #include "sd_bench.h"
+#include "recorder.h"
 #include "dac.h"
 #include "psram.h"
 #include "psram_ring.h"
@@ -67,11 +68,19 @@
 // LED1 flash per detected bat pulse; long enough to see (calls are 1-30 ms)
 #define PULSE_LED_MS       50U
 
-// PLAYBACK button: must read the same for 3 x 10 ms ticks to count
-#define PLAYBACK_DEBOUNCE_TICKS  3U
+// PLAYBACK and RECORD: must read the same for 3 x 10 ms ticks to count
+#define BUTTON_DEBOUNCE_TICKS    3U
 
-// How long "PLAY: no ring" / "PLAY: busy" stays up before the LO readout returns
-#define PLAYBACK_MESSAGE_MS      2000U
+// How long a message ("PLAY: busy", "REC: SD full", ...) stays up in the
+// LO readout's place
+#define LABEL_MESSAGE_MS         2000U
+
+// What the LO readout's spot shows, so it's only redrawn when that changes
+#define LABEL_LO                 0U
+#define LABEL_MESSAGE            1U
+#define LABEL_SAVING             2U
+#define LABEL_PLAYBACK           0x10000U   // + seconds left
+#define LABEL_RECORDING          0x20000U   // + seconds recorded
 
 /* USER CODE END PD */
 
@@ -506,12 +515,14 @@ int main(void)
   uint32_t lastPulseCount = 0;
   uint32_t pulseLedOffTick = 0;
 
-  // Starts as "held", so a press left over from the power-up SD test has
-  // to be released before it counts
+  // Both start as "held", so a press left over from a power-up test
+  // (PLAYBACK: SD speed, RECORD: full PSRAM) has to be released before it counts
   uint8_t playbackButton = 1;
   uint8_t playbackDebounce = 0;
-  uint32_t playbackLabel = 0;           // seconds shown in the playback label; 0 = LO label shown
-  uint32_t playbackMessageUntil = 0;
+  uint8_t recordButton = 1;
+  uint8_t recordDebounce = 0;
+  uint32_t headerLabel = LABEL_LO;      // LABEL_...: what the LO readout's spot shows
+  uint32_t messageUntil = 0;            // a message stays up until this tick
 
   Waterfall_SetLOFrequency(frequency);
 
@@ -548,21 +559,22 @@ int main(void)
 
 	            lastADC = adc;
 
-	            // the playback label has the spot while it's up
-	            if(playbackLabel == 0)
+	            // a message, playback or recording label has the spot while it's up
+	            if(headerLabel == LABEL_LO)
 	            {
 	                ShowLoLabel(frequency);
 	            }
 	        }
 
-	        // PLAYBACK: replay the last 2 s ten times slower; press again to stop
+	        // PLAYBACK: replay the last 2 s ten times slower; press again to stop.
+	        // Not while a recording is open: playback pauses the ring it reads from.
 	        uint8_t playbackDown = (HAL_GPIO_ReadPin(PLAYBACK_BUTTON_GPIO_Port, PLAYBACK_BUTTON_Pin) == GPIO_PIN_RESET);
 
 	        if(playbackDown == playbackButton)
 	        {
 	            playbackDebounce = 0;
 	        }
-	        else if(++playbackDebounce >= PLAYBACK_DEBOUNCE_TICKS)
+	        else if(++playbackDebounce >= BUTTON_DEBOUNCE_TICKS)
 	        {
 	            playbackButton = playbackDown;
 	            playbackDebounce = 0;
@@ -573,36 +585,117 @@ int main(void)
 	            }
 	            else if(playbackButton)
 	            {
-	                Playback_Status_t status = Playback_Start();
+	                Playback_Status_t status = (Recorder_GetState() != RECORDER_IDLE) ? PLAYBACK_ERR_BUSY : Playback_Start();
 
-	                playbackLabel = UINT32_MAX;         // redraw now
-	                playbackMessageUntil = lastRead;
+	                messageUntil = lastRead;            // the playback label replaces any message
 
 	                if(status != PLAYBACK_OK)
 	                {
 	                    ILI9341_WriteString(5, 5, (status == PLAYBACK_ERR_BUSY) ? "PLAY: busy   " : "PLAY: no ring",
 	                            Font_16x26, ILI9341_WHITE, ILI9341_BLACK);
-	                    playbackMessageUntil = lastRead + PLAYBACK_MESSAGE_MS;
+	                    headerLabel = LABEL_MESSAGE;
+	                    messageUntil = lastRead + LABEL_MESSAGE_MS;
 	                }
 	            }
 	        }
 
-	        // Playback label: "PLAY 10x  20s", counting down. Put the LO
-	        // readout back once playback (or an error message) is over.
-	        if(Playback_IsActive())
+	        // RECORD: record to SD from 5 s before the press; press again to stop.
+	        // Not during playback: the ring is paused, so there's no live audio.
+	        // A press while the last recording is still saving is ignored.
+	        uint8_t recordDown = (HAL_GPIO_ReadPin(RECORD_BUTTON_GPIO_Port, RECORD_BUTTON_Pin) == GPIO_PIN_RESET);
+
+	        if(recordDown == recordButton)
+	        {
+	            recordDebounce = 0;
+	        }
+	        else if(++recordDebounce >= BUTTON_DEBOUNCE_TICKS)
+	        {
+	            recordButton = recordDown;
+	            recordDebounce = 0;
+
+	            if(recordButton && (Recorder_GetState() == RECORDER_RECORDING))
+	            {
+	                Recorder_Stop();
+	            }
+	            else if(recordButton && (Recorder_GetState() == RECORDER_IDLE))
+	            {
+	                // mounts the card and scans its folder: can hold the main loop ~0.1 s
+	                const char *message = Playback_IsActive() ? "REC: playing " : NULL;
+
+	                if(message == NULL)
+	                {
+	                    Recorder_Status_t status = Recorder_Start();
+
+	                    if(status != RECORDER_OK)
+	                    {
+	                        message = Recorder_StatusText(status);
+	                    }
+	                }
+
+	                messageUntil = lastRead;
+
+	                if(message != NULL)
+	                {
+	                    ILI9341_WriteString(5, 5, message, Font_16x26, ILI9341_WHITE, ILI9341_BLACK);
+	                    headerLabel = LABEL_MESSAGE;
+	                    messageUntil = lastRead + LABEL_MESSAGE_MS;
+	                }
+	            }
+	        }
+
+	        // A recording that ended by itself (an error, or the time limit) says why
+	        Recorder_Status_t recordEnd = Recorder_TakeResult();
+
+	        if(recordEnd != RECORDER_OK)
+	        {
+	            ILI9341_WriteString(5, 5, Recorder_StatusText(recordEnd), Font_16x26, ILI9341_WHITE, ILI9341_BLACK);
+	            headerLabel = LABEL_MESSAGE;
+	            messageUntil = lastRead + LABEL_MESSAGE_MS;
+	        }
+
+	        // The LO readout's spot: a message for 2 s, else the playback
+	        // countdown ("PLAY 10x  20s"), the recording time ("REC   1:23"),
+	        // or "REC saving" while the backlog is written out. The LO readout
+	        // comes back when none of them is up.
+	        Recorder_State_t recordState = Recorder_GetState();
+
+	        if((int32_t)(lastRead - messageUntil) < 0)
+	        {
+	            // a message is up: leave it
+	        }
+	        else if(Playback_IsActive())
 	        {
 	            uint32_t seconds = (Playback_GetRemainingMs() + 999U) / 1000U;
 
-	            if(seconds != playbackLabel)
+	            if(headerLabel != (LABEL_PLAYBACK + seconds))
 	            {
-	                playbackLabel = seconds;
+	                headerLabel = LABEL_PLAYBACK + seconds;
 	                snprintf(text, sizeof(text), "PLAY %lux %3lus", (unsigned long)PLAYBACK_EXPANSION, seconds);
 	                ILI9341_WriteString(5, 5, text, Font_16x26, ILI9341_WHITE, ILI9341_BLACK);
 	            }
 	        }
-	        else if((playbackLabel != 0) && ((int32_t)(lastRead - playbackMessageUntil) >= 0))
+	        else if(recordState == RECORDER_RECORDING)
 	        {
-	            playbackLabel = 0;
+	            uint32_t seconds = Recorder_GetElapsedMs() / 1000U;
+
+	            if(headerLabel != (LABEL_RECORDING + seconds))
+	            {
+	                headerLabel = LABEL_RECORDING + seconds;
+	                snprintf(text, sizeof(text), "REC %3lu:%02lu   ", seconds / 60U, seconds % 60U);
+	                ILI9341_WriteString(5, 5, text, Font_16x26, ILI9341_RED, ILI9341_BLACK);
+	            }
+	        }
+	        else if(recordState == RECORDER_SAVING)
+	        {
+	            if(headerLabel != LABEL_SAVING)
+	            {
+	                headerLabel = LABEL_SAVING;
+	                ILI9341_WriteString(5, 5, "REC saving   ", Font_16x26, ILI9341_RED, ILI9341_BLACK);
+	            }
+	        }
+	        else if(headerLabel != LABEL_LO)
+	        {
+	            headerLabel = LABEL_LO;
 	            ShowLoLabel(frequency);
 	        }
 
@@ -631,6 +724,9 @@ int main(void)
 	    // SD write test (capture.py sdtest), when running. Ahead of the FFT
 	    // so the writer gets priority, as a recorder would need.
 	    SdBench_Poll();
+
+	    // WAV recording to SD, when running: ahead of the FFT for the same reason
+	    Recorder_Poll();
 
 	    FFT_Process();
 
@@ -1269,7 +1365,8 @@ static void MX_GPIO_Init(void)
 /* USER CODE BEGIN 4 */
 
 // LO readout at the top left. Fixed 13-char width: ends at x=213, clear of
-// the battery readout. The playback label uses the same spot.
+// the battery readout. The playback and recording labels, and messages,
+// use the same spot.
 static void ShowLoLabel(uint32_t frequency)
 {
     char text[32];

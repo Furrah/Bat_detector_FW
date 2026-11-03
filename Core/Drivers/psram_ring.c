@@ -117,6 +117,7 @@ static volatile uint8_t  running = 0;
 static volatile uint8_t  paused = 0;            /* not recording; reads still run */
 static volatile uint8_t  busy = 0;              /* a burst is in flight */
 static volatile uint32_t pushedBlocks = 0;
+static volatile uint32_t resumeBlock = 0;       /* first block recorded since the last pause ended */
 static volatile uint32_t blockTicks = 0;        /* PushBlock calls, paused or not: the stuck-burst clock */
 
 /* The block being written. writeSource is NULL when there's none. */
@@ -404,7 +405,20 @@ uint8_t PsramRing_IsRunning(void)
 
 void PsramRing_SetPaused(uint8_t pause)
 {
+    /* pushedBlocks doesn't move while paused, so this is the next block to
+     * be recorded; set before recording restarts */
+    if(paused && !pause)
+    {
+        resumeBlock = pushedBlocks;
+    }
+
     paused = pause;
+}
+
+
+uint32_t PsramRing_GetResumeBlock(void)
+{
+    return resumeBlock;
 }
 
 

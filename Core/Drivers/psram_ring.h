@@ -69,6 +69,14 @@ void PsramRing_SetPaused(uint8_t pause);
 /* Running and not paused: the block being processed now is being recorded */
 uint8_t PsramRing_IsRecording(void);
 
+/*
+ * The first block recorded since the last pause ended (0 if never paused).
+ * Block numbers carry straight on across a pause, so the blocks before this
+ * one are from before the pause: a recording's pre-trigger mustn't reach
+ * back past it, or it would join audio from either side of the gap.
+ */
+uint32_t PsramRing_GetResumeBlock(void);
+
 /* Audio interrupt, once per block, before the DSP: queue the block for writing */
 void PsramRing_PushBlock(const uint16_t *block);
 

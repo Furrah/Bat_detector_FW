@@ -31,7 +31,8 @@
  *        FFT_Process's arg1 magnitudes for it (float), bins 0-1 included
  *
  * One 8 KB buffer holds the snapshot, the energy FIFO or the SD write
- * test's blocks, so starting one stops the energy stream.
+ * test's blocks, so starting one stops the energy stream. It's lent to the
+ * WAV recorder while that records (DebugLink_LendBuffer).
  *
  * The audio interrupt fills the buffer and the main loop sends it with
  * CDC_Transmit_FS, which reports busy until the previous transfer has
@@ -51,6 +52,7 @@
 
 #include "main.h"
 #include "pipeline_config.h"
+#include "recorder.h"
 #include "sd_bench.h"
 #include "sd_spi.h"
 #include "usbd_cdc_if.h"
@@ -147,6 +149,8 @@ typedef union
 _Static_assert(sizeof(((DebugCaptureBuffer_t *)0)->fft) <= sizeof(((DebugCaptureBuffer_t *)0)->samples),
         "FFT capture doesn't fit the snapshot buffer");
 
+_Static_assert(sizeof(DebugCaptureBuffer_t) == DEBUG_LINK_BUFFER_BYTES, "the lent buffer's size is in debug_link.h");
+
 typedef enum
 {
     DEBUG_MODE_IDLE = 0,
@@ -155,7 +159,8 @@ typedef enum
     DEBUG_MODE_ENERGY,          /* the interrupt adds an energy record per block */
     DEBUG_MODE_READBACK,        /* the PSRAM ring is reading the snapshot back */
     DEBUG_MODE_SD_BENCH,        /* the SD write test has the buffer */
-    DEBUG_MODE_FFT_CAPTURE      /* the FFT is capturing a frame and its result */
+    DEBUG_MODE_FFT_CAPTURE,     /* the FFT is capturing a frame and its result */
+    DEBUG_MODE_LENT             /* lent to the WAV recorder */
 } DebugMode_t;
 
 typedef enum
@@ -260,6 +265,15 @@ static const DebugStat_t debugStats[] =
     { "sdUseDma",               'b', &sdUseDma },
     { "sdRecoveries",           'u', &sdRecoveries },
     { "sdRecoveryFailures",     'u', &sdRecoveryFailures },
+
+    /* WAV recorder (recorder.h); all but recFile are for the current or last recording */
+    { "recFile",                'u', &recFile },
+    { "recBlocks",              'u', &recBlocks },
+    { "recMaxBacklog",          'u', &recMaxBacklog },
+    { "recMaxWriteUs",          'u', &recMaxWriteUs },
+    { "recMaxSyncUs",           'u', &recMaxSyncUs },
+    { "recReadFailures",        'u', &recReadFailures },
+    { "recLastEnd",             'u', &recLastEnd },
 
     /* Bat detector */
     { "batEnergyDb",            'f', &batEnergyDb },
@@ -688,7 +702,7 @@ static void DebugLink_HandleCommand(uint8_t command)
         break;
 
     case 'E':
-        if((mode == DEBUG_MODE_SD_BENCH) || (mode == DEBUG_MODE_FFT_CAPTURE))
+        if((mode == DEBUG_MODE_SD_BENCH) || (mode == DEBUG_MODE_FFT_CAPTURE) || (mode == DEBUG_MODE_LENT))
         {
             break;      /* the buffer is taken */
         }
@@ -709,7 +723,7 @@ static void DebugLink_HandleCommand(uint8_t command)
         {
             SdBench_Stop();     /* keeps the buffer until its result has been sent */
         }
-        else
+        else if(mode != DEBUG_MODE_LENT)    /* the recorder keeps a lent buffer */
         {
             FFT_CancelCapture();
             mode = DEBUG_MODE_IDLE;
@@ -775,7 +789,7 @@ static void DebugLink_Reset(void)
             mode = DEBUG_MODE_IDLE;
         }
     }
-    else
+    else if(mode != DEBUG_MODE_LENT)    /* runs on every pass with USB unplugged: the recorder keeps the buffer */
     {
         FFT_CancelCapture();
         mode = DEBUG_MODE_IDLE;
@@ -835,5 +849,45 @@ void DebugLink_Poll(void)
     DebugLink_ContinueFrame();
 }
 
+
+void *DebugLink_LendBuffer(void)
+{
+    /* an energy frame on its way out is still being read from the buffer */
+    const uint8_t sendingEnergy = (txStage != TX_IDLE) && (txHeader.type == 'E');
+
+    if((mode == DEBUG_MODE_IDLE) || ((mode == DEBUG_MODE_ENERGY) && !sendingEnergy))
+    {
+        /* stops an energy stream: the audio interrupt checks the mode before
+         * touching the buffer, and can't be part-way through while this runs */
+        mode = DEBUG_MODE_LENT;
+        return &captureBuffer;
+    }
+
+    return NULL;
+}
+
+
+void DebugLink_ReturnBuffer(void)
+{
+    if(mode == DEBUG_MODE_LENT)
+    {
+        mode = DEBUG_MODE_IDLE;
+    }
+}
+
+
+#else /* DEBUG_CAPTURE */
+
+/* The debug link is left out, but the recorder still needs the buffer */
+static uint32_t lendBuffer[DEBUG_LINK_BUFFER_BYTES / sizeof(uint32_t)];
+
+void *DebugLink_LendBuffer(void)
+{
+    return lendBuffer;
+}
+
+void DebugLink_ReturnBuffer(void)
+{
+}
 
 #endif /* DEBUG_CAPTURE */

@@ -77,7 +77,7 @@ STAT_ENTRY = struct.Struct("<27scI")
 # Counters that must stay 0, and limits (CLAUDE.md)
 STATS_MUST_BE_ZERO = {"dacLateBlocks", "psramRingOverTcem", "psramRingLateBlocks", "sdErrorCount",
                       "sdHalFailures", "sdStaleRx",
-                      "psramRingFaults", "playbackUnderruns"}
+                      "psramRingFaults", "playbackUnderruns", "recReadFailures"}
 STATS_LIMITS = {"psramRingMaxSelectNs": (8000, "the PSRAM's 8 us tCEM"),
                 "dspLoadMaxPercent": (100, "a whole block period")}
 
