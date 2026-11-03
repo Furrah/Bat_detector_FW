@@ -16,8 +16,8 @@ Handheld, battery-powered ultrasonic bat detector covering the 20–120 kHz echo
 
 - CubeMX-generated files: only edit inside `/* USER CODE BEGIN */ … /* USER CODE END */` blocks. Anything outside is wiped when the .ioc is regenerated.
 - Make incremental, targeted changes scoped to the function or module in question, with the rationale stated. No whole-file rewrites.
-- RAM: 1.0 KB free with the USB debug capture, the PSRAM ring, playback and the SD write test built in (31.8 KB used, including a 2 KB stack, a 0.5 KB heap reservation, 1 KB of PSRAM-ring interrupt code that runs from RAM, and playback's 1 KB of block buffers). `DEBUG_CAPTURE 0` in `debug_link.h` frees its 8 KB buffer. No malloc, no large stack buffers.
-- Flash: 88.7 KB of 128 KB used at `-Og` (95 KB at `-O0` before the capture module). Large constant tables belong in flash rather than RAM.
+- RAM: 848 B free with the USB debug capture, the PSRAM ring, playback, the SD write test and the WAV recorder built in (31.2 KB used, including a 2 KB stack, a 0.5 KB heap reservation, 1 KB of PSRAM-ring interrupt code that runs from RAM, and playback's 1 KB of block buffers). The debug capture's 8 KB buffer is shared with the recorder and the SD test, so `DEBUG_CAPTURE 0` in `debug_link.h` no longer frees it; it frees only the module's code and ~0.5 KB of its state. No malloc, no large stack buffers.
+- Flash: 90.3 KB of 128 KB used at `-Og` (95 KB at `-O0` before the capture module). Large constant tables belong in flash rather than RAM.
 - Interrupt priorities: DMA2 Channel 1 (the PSRAM ring's burst interrupt) must be the only interrupt at priority 0; everything else at 1 or lower. `PsramRing_Start()` refuses to run otherwise (boot screen: "Ring: NVIC prio"). Diary entry 34.
   - CubeMX defaults a newly enabled peripheral interrupt to priority 0. It did that to SPI2's global interrupt (Nov 2); check every new interrupt's priority after generating.
   - `__disable_irq()` blocks priority 0 too. Keep masked sections in code that runs while the ring is busy to a few dozen instructions: a masked section that delays a burst's end stretches CE#. Bursts have ~3.5 µs of slack (entry 36).
@@ -41,6 +41,8 @@ Handheld, battery-powered ultrasonic bat detector covering the 20–120 kHz echo
   - CE# may stay low for at most tCEM = 8 µs (refresh). At 42.5 MHz that limits DMA bursts to ~32 bytes.
   - Verified on hardware: ID 0D/5D and the address-line test pass. The polled `-O0` driver uses 8-byte bursts; CE# max measured 5.0 µs.
 - SPI2: ILI9341 2.4" TFT + its on-module SD slot, shared. The display has its own CS on V2. SD MOSI/CLK go through 33 Ω. No touch controller is wired.
+  - SD MISO (PB14) has no external pull-up; the internal pull-up is on (CubeMX, Nov 2, diary 42). Without it, a missing card floats MISO low and reads as "busy" (a 500 ms timeout) instead of "no card".
+  - Use a card that fits the slot natively. A microSD in an SD adapter kept losing contact (Nov 2).
 - SD card runs in SPI mode (G431 has no SDMMC). USB-C exposes the card via USB device MSC. FatFS and USB MSC must never access the card at the same time (needs a mutual-exclusion state machine).
 - Power: system always runs from the 3.7 V LiPo (MCP73831 charger; USB only charges). There is no 5 V rail.
   - The MCP1700 LDO is always on. The S1 slide switch sits between the LDO output and the 3V3 rail.
@@ -85,6 +87,7 @@ Unused: PA7, PA10, PA15, PB1, PB9, PC13.
   - FFT check: `python -I Tools/capture.py fftcheck --count 10` compares `FFT_Process` with numpy `rfft` on the same raw frame; passes below 1e-4 of the largest bin. Measured 6.8e-8 (Nov 2, after the `-O2` change).
   - Stats: `python -I Tools/capture.py stats` reads every Live Expressions counter over USB (DSP and FFT timing, DAC, PSRAM ring, playback, detector) and flags any out of limits; `--window 30` restarts the worst-case timings first and reads them 30 s later. The table is `debugStats[]` in `debug_link.c`; add an entry there and the PC picks it up.
   - Hooks: `DebugLink_AddBlock` in `DSP_ProcessBlock`, `DebugLink_OnReceive` in `usbd_cdc_if.c` `CDC_Receive_FS`, `DebugLink_Poll` in the main loop.
+  - `DebugLink_LendBuffer()` / `DebugLink_ReturnBuffer()` lend its 8 KB buffer to the WAV recorder ("lent" mode: `R`/`E`/`M`/`F`/`W` are refused, and an unplugged USB doesn't reclaim it). With `DEBUG_CAPTURE 0` they hand out a plain 8 KB buffer.
   - PC side: `python -I Tools/capture.py info|raw|energy|sdtest --label <note>` saves `Captures/*.npz`. `python -I Tools/analyse_capture.py <file.npz>` prints the analysis and writes a PNG: spectrum lines, noise, the detector's predicted input, energy periodicities, and an offline detector replay with a threshold sweep. Needs `python -m pip install pyserial numpy matplotlib` (installed).
   - Keep `DETECTOR` in `analyse_capture.py` in step with `bat_detect.c`; the replay reports if it disagrees with the board.
 - `dac.c`: each DSP block is copied straight into the half of the circular DAC buffer that the DMA isn't reading, chosen from the DMA's remaining count (CNDTR). `dacLateBlocks` counts blocks that collided with the DMA; it should stay 0.
@@ -112,6 +115,7 @@ Unused: PA7, PA10, PA15, PB1, PB9, PC13.
   - Timing diagnostics: `psramRingMinSelectNs`, `psramRingMaxEntryNs` (CE# low to interrupt start), `psramRingMaxIsrNs` (CPU per burst), `psramRingBursts`. Write 1 to `psramRingResetStats` to restart them.
   - Verify with `python -I Tools/capture.py verify --count 50`: debug link `M` reads the last snapshot back from the ring and the PC compares it bit for bit. It fails while playback has the ring paused.
   - `PsramRing_SetPaused()` stops recording (reads still run); `PsramRing_GetWrittenBlocks()` gives the newest readable block + 1.
+  - Block numbers carry straight on across a pause. `PsramRing_GetResumeBlock()` gives the first block after the last one, so a pre-trigger never joins audio from either side of a playback.
 - `playback.c` (Core/DSP): time-expansion playback, verified on hardware 2026-10-30 (diary 37). PLAYBACK replays the last `PLAYBACK_SECONDS` (2 s) from the ring `PLAYBACK_EXPANSION` (10, in `pipeline_config.h`) times slower; press again to stop.
   - Linear interpolation at the full 250 kHz DAC rate, after the same 10 kHz high-pass as the heterodyne. Replaces the heterodyne output while active (`DSP_ProcessBlock`); detector and waterfall stay live.
   - The ring is paused during playback and resumes when it ends. Two 512-byte slots: one plays while the next block loads.
@@ -124,9 +128,19 @@ Unused: PA7, PA10, PA15, PB1, PB9, PC13.
   - Diagnostics in `capture.py stats`: `sdErrorCount`, `sdLastError` (step, status, reply, command of the first failure), `sdLastCardStatus` (CMD13 after a failed write), `sdLateResponse` (the late-response probe), `sdBusyMaxUs`, and self-checks `sdHalFailures` and `sdStaleRx`.
 - `sd_bench.c` (Core/Src): sustained SD write test under recording load (diary 38–40), built 2026-11-02. `python -I Tools/capture.py sdtest --seconds 60 --pretrigger 5 --sectors 1 4 8 16 --dma 0` (one run per setting, then a summary table).
   - Copies the ring's live audio to `SBnnX.RAW` (nn sectors per write, X = P polled / D DMA; raw uint16 ADC codes at 250 kHz, no header), N 512-byte blocks per `f_write` (N = 1, 2, 4, 8 or 16; N > 1 becomes one CMD25 multi-block write), starting the pre-trigger behind the ring. Up to N = 8 the next chunk loads from the ring while one is written; at 16 the whole 8 KB buffer is one chunk.
-  - Check the files on the PC with `python -I Tools/check_raw.py D:\SB08P.RAW`: every word must be a 12-bit code. A run that fails before `f_close` leaves an empty file and lost clusters (chkdsk shows them).
+  - Check the files on the PC with `python -I Tools/check_raw.py D:\SB08P.RAW`: every word must be a 12-bit code. It also checks the recorder's `.WAV` files. A run that fails before `f_close` leaves an empty file and lost clusters (chkdsk shows them).
   - Results (polled, diary 39–40): single-sector 0.88× (fails); 4 / 8 / 16 sectors 1.20× / 1.41× / 1.27× while catching up; 8 sectors 1.38× catching up and 1.93× caught up over 180 s, worst write 22 ms. Reports the rate while catching up, the `f_write` busy fraction once caught up, the backlog, lost blocks, a write-time histogram, how much the FFT drops, and the driver's diagnostics.
   - `SdBench_Poll` runs in the main loop ahead of `FFT_Process`, writing for up to 20 ms per call: the writer gets priority, as a recorder would need. It borrows the debug link's 8 KB buffer, so `R`/`E`/`M` are refused while it runs.
+- `recorder.c` (Core/Src): WAV recording to SD on RECORD, verified on hardware 2026-11-02 (diary 41): 6 recordings, 50 s, all files valid, the pre-trigger lined up within the button's debounce. A card removed and put back while the board runs records again without a restart (diary 42). Still to test: a 10-minute recording, a power cut (S1), and recording straight after a playback. A recording that loses its card leaves its file as of the last sync (empty if under 2 s), plus lost clusters for chkdsk.
+  - RECORD starts a recording 5 s before the press (`RECORDER_PRETRIGGER_SECONDS`, `recorder.h`); a second press stops it. Files stop at `RECORDER_MAX_SECONDS` (600 s, 300 MB).
+  - Files are `BATnnnnn.WAV` in the root folder (next number after the highest there; never overwrites). Mono 16-bit PCM at 250 kHz, samples `(code − 2048) × 16`, so the low 4 bits are always 0.
+  - The header is 512 bytes (a 460-byte `JUNK` pad) so the audio stays sector-aligned. The first chunk is 7 blocks, then 8-block chunks on 8-sector file offsets, so each `f_write` is one 8-sector write. Don't shrink the header to 44 bytes.
+  - It writes the same way as `sd_bench.c` (8 sectors polled, double-buffered from the ring, ahead of the FFT, up to 20 ms per `Recorder_Poll`) and borrows the debug link's buffer.
+  - Every 2 s: `f_sync`, then the header's sizes are rewritten straight to the file's first sector with `disk_write` (no `f_lseek`, which would walk the FAT chain). A power cut loses at most 2 s.
+  - Stopping writes out the backlog first ("REC saving"). If the ring overwrites unsaved audio, the recording stops ("REC: SD slow") rather than splicing. The card is mounted afresh at each start.
+  - PLAYBACK is refused while a recording is open ("PLAY: busy"), RECORD during playback ("REC: playing"). The display shows "REC   1:23" in the LO readout's place.
+  - Counters in `capture.py stats`: `recFile`, `recBlocks`, `recMaxBacklog`, `recMaxWriteUs`, `recMaxSyncUs`, `recReadFailures` (must stay 0), `recLastEnd`. Measured: slowest write 15.3 ms, slowest sync 6.1 ms, most backlog 4917 blocks (the pre-trigger).
+  - `blockCount` − `psramRingBlocks` is how many blocks the ring spent paused (playback).
 - Boot checks run before the audio starts:
   - PSRAM: hold RECORD at power-up for the full 8 MB test (~35 s).
   - SD: hold PLAYBACK at power-up for a 256 KB write/read speed test. It leaves `SDTEST.BIN` on the card. Measured W666 R648 kB/s; its 64-byte `f_write` calls make every transfer single-sector.
@@ -169,17 +183,21 @@ Bugs already fixed — do not reintroduce:
   1. V1 features running on V2. Done.
   2. PSRAM bring-up. Done; the full 8 MB test is still to run once.
   3. SD bring-up. Done (Nov 2, diary 38–40): format, mount, recovery, and 8-sector polled writes keeping up under full recording load, with the data verified on the PC.
-  4. RAM reclaim (done Oct 30), then the DMA-driven PSRAM ring buffer (verified Oct 30), then WAV recording to SD.
+  4. RAM reclaim (done Oct 30), then the DMA-driven PSRAM ring buffer (verified Oct 30), then WAV recording to SD (verified Nov 2; long-run and power-cut tests still to do).
   5. Time-expansion playback from PSRAM on PLAYBACK. Version 1 built (fixed 10×, last 2 s). Next: start at the detector's last bat pass; a knob-set factor.
 - Amplifier gating ("squelch"): switch `AMP_EN` on only while bats are detected.
   - Stage 1 (the monitor-only detector) is built; tune it in the field first.
   - Stage 2: drive `AMP_EN` from it, with a fade, amp off at zero volume, and forced on during playback.
   - The squelch-off (always-on) control is deferred.
 - Recording architecture: SD writes can stall 100–250 ms (up to 125 KB at 500 kB/s), so PSRAM writes must be driven from the ADC ISR side. One ISR-driven SPI1 engine owns the PSRAM; the SD writer and the playback prefetch queue read requests to it.
-  - Measured under recording load (diary 39–40): single-sector writes can't keep up (0.88×); 8-sector polled multi-block writes can (1.38× catching up, 1.93× caught up), using an 8 KB double buffer. That buffer is the debug capture's today; the recorder needs its own or must share it. `f_sync` periodically, or an interrupted recording leaves an empty file.
+  - Measured under recording load (diary 39–40): single-sector writes can't keep up (0.88×); 8-sector polled multi-block writes can (1.38× catching up, 1.93× caught up), using an 8 KB double buffer. The recorder shares the debug capture's buffer and syncs every 2 s (diary 41).
 - Finish the DSP chain: bandpass around the 1–2 kHz output, float throughout to avoid inter-stage truncation, and wire in the notch filter. It is initialised in `DSP_Init` but not connected in `DSP_ProcessBlock`, and `dsp_filters.h` hasn't been reviewed yet.
 - Time-expansion mode: capture a detected call from PSRAM and play it back slowed down. The record button writes the PSRAM pre-trigger data to SD, followed by the live stream.
-- WAV header formatting compatible with bat-ID software.
+- Species classifier (`Docs/Bat Species Classifier.md`): parked on the device (diary 43). It needs ~3.6 KB of RAM (848 B free) and an estimated 23–44% of the CPU, and there's no bat data to fit its rules until spring.
+  - `Tools/classify.py` models stages 1–3 (frames, segmenter, features) at 250 kHz: 128-point FFT, 64-sample hop. It runs on any WAV or `.RAW` (`--plot` draws the call tracks over a spectrogram). Five changes from the doc are listed in diary 43; `--doc-params` runs the doc's original values.
+  - `python -I Tools/classify.py --selftest` runs the doc's bench signals (`Tools/bat_signals.py`, synthesised in the board's measured noise; it also writes them to `Captures/synth`) and must pass after any change to the model.
+  - Next: stages 4–6 on the PC; fit the rules to recorded passes in spring. If it proves accurate, the first on-device option is classifying a pass on demand from the PSRAM ring, borrowing the recorder's buffer.
+- WAV metadata for bat-ID software: the files are plain PCM WAV today. Next, a GUANO chunk in the header's 460-byte pad (no layout change). Timestamps need Y1.
 - Battery gauge accuracy: the reading is ratiometric to VDDA, which sags once the MCP1700 drops out near empty. That needs VREFINT, which is on ADC1, the audio ADC.
 - Gain range switching or AGC.
 - At 250 kHz, recording streams 500 kB/s to PSRAM and SD, and the PSRAM holds 16.8 s of history.

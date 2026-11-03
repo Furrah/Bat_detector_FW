@@ -649,13 +649,165 @@ Entries are in order, with the newest at the bottom. Decisions that are agreed b
   - A card that has been fed garbage can need a power cycle; CMD0 alone may not bring it back. Power-cycle the card (S1) between failing tests.
   - FatFS writes a file's directory entry only on `f_sync` or `f_close`, so an aborted write leaves an empty file and lost cluster chains. The recorder should `f_sync` periodically.
 
+## 2026-11-02: WAV recording
+
+### 41. RECORD writes a WAV file: 5 s of pre-trigger, a sector-sized header, synced every 2 s (Nov 2)
+- **Decision:** RECORD starts a recording in `recorder.c` and a second press stops it.
+  - Each recording is a new file, `BATnnnnn.WAV`, in the card's root folder: mono 16-bit PCM at 250 kHz, the raw ADC signal.
+  - It starts 5 s before the press, taken from the PSRAM ring, and carries on with the live audio. Files stop at 10 minutes (300 MB).
+  - It writes the same way as the SD test that kept up (entries 39–40): 8 sectors per `f_write`, polled, double-buffered from the ring, ahead of the FFT in the main loop.
+- **Context:** entries 38–40 proved the card can keep up under the full recording load. This turns that test into the product feature.
+- **Why (with numbers):**
+  - **Samples are `(code − 2048) × 16`.**
+    - The ADC's full scale becomes 16-bit full scale, so levels in dBFS mean the same in any software.
+    - The low 4 bits are always 0. The PC checker uses that as a corruption test: a block shifted on the card sets them in 15 of every 16 samples.
+    - The front end's actual mid-rail bias error stays in the file as a small DC offset; bat software filters it out.
+  - **A 512-byte header, not the usual 44 bytes.**
+    - With 44 bytes, every 4 KB chunk would start 44 bytes into a sector. FatFS would read, merge and rewrite the two partial sectors of every chunk, and the 8-sector writes measured in entry 39 would be lost.
+    - Padding the header to one sector (a 460-byte `JUNK` chunk, which every reader skips) keeps the audio sector-aligned. The pad leaves room for GUANO metadata later.
+    - The first block is chosen so that the first chunk is 7 blocks and every later chunk starts on a multiple of 8 file sectors. With 32 KB clusters, a chunk then never crosses a cluster boundary, so each `f_write` is still one 8-sector write.
+  - **Synced every 2 s, with the header patched in place.**
+    - FatFS writes a file's size only on `f_sync` or `f_close` (entry 40), and the WAV header's two size fields are unknown until the end. A power cut would otherwise leave an empty or unreadable file.
+    - The sync writes FatFS's size and FAT first, then the header. In that order, a power cut between them leaves a header that claims less audio than the file holds, never more.
+    - The header goes straight to its sector with `disk_write`. The `f_lseek(0)`, write, seek-to-end alternative makes FatFS walk the cluster chain from the start on the way back: one FAT sector per 128 clusters (8.4 s of audio), so 72 sector reads per sync for a 10-minute file.
+    - Writing behind FatFS's back is safe here because the recorder only ever writes whole sectors. FatFS sends those straight to the card and never caches them.
+    - Estimated cost: about 5 small writes and 1 read per sync, ~10 ms every 2 s (0.5%). Still to be measured (`recMaxSyncUs`).
+  - **A 5 s pre-trigger.** That's the setting entry 40 measured: it cleared in 13.1 s at 1.38×, against the ring's 16.8 s.
+    - Until it has caught up, the file runs behind the live audio. Stopping writes out the backlog first ("REC saving"). A 3 s recording with 5 s of pre-trigger needs about 2.8 s of saving.
+  - **The pre-trigger never reaches back past a playback pause.**
+    - The ring's block numbers carry straight on across a pause (playback pauses it for 20 s).
+    - Without a guard, a recording made right after playback would join audio from before the playback to audio from after it, 20 s apart, and nothing in the file would show it.
+    - `PsramRing_GetResumeBlock()` gives the first block after the last pause.
+  - **If the ring overwrites audio not yet saved, the recording stops** ("REC: SD slow").
+    - The SD test skips ahead instead. In a recording, a silent splice would give wrong call intervals.
+    - A block the ring fails to read is saved as silence and counted (`recReadFailures`, which must stay 0).
+  - **The recorder borrows the debug capture's 8 KB buffer.** RAM had 1.0 KB free, so there's no room for a second buffer.
+    - The debug link gained a "lent" mode: snapshot, energy, read-back, FFT capture and the SD test are refused while it's lent.
+    - With `DEBUG_CAPTURE 0`, the same functions hand out a plain 8 KB buffer, so the recorder works either way.
+    - Lending is refused while the debug link is using the buffer ("REC: busy"). That only happens with a PC connected and a capture running.
+  - **The card is mounted afresh at every start**, so a card inserted after boot, or swapped, is picked up.
+    - Remounting re-reads the volume but doesn't restart a card that is already running.
+    - The folder scan for the next number reads 16 names per sector: about 60 ms for 1000 files.
+    - The start position is fixed before that work, so it doesn't eat into the pre-trigger.
+  - **PLAYBACK is refused while a recording is open** ("PLAY: busy"), because playback pauses the ring the recording reads from. RECORD during playback shows "REC: playing".
+- **Alternatives considered:**
+  - **Refactor `sd_bench.c`'s write loop into a shared engine:** rejected for now. It would put the verified benchmark at risk. `recorder.c` repeats about 100 lines of it, specialised (fixed 8 sectors, WAV conversion, stop handling, syncs).
+  - **Patch the header only at `f_close`, and repair files after a power cut with a PC tool:** simpler, but a power cut is the case that matters.
+  - **Pre-allocate the file with `f_expand` and stream one long CMD25:** possibly faster, but a bigger change. Parked.
+  - **Header sizes set to the 10-minute maximum up front:** depends on how tolerant each reader is of a short file. Rejected.
+  - **GUANO metadata now:** deferred. The header's pad already has room for it.
+- **Costs:** flash 88.7 → 90.3 KB (`recorder.c` is 2.2 KB). RAM 1008 → 848 B free: its own `FIL`, flags, state and 7 counters. The 8 KB buffer is shared, not added.
+- **Outcome:** works on hardware (Nov 2).
+  - **First card (a microSD in an SD adapter):** 6 recordings, all valid WAV files.
+    - Three were shorter than the 5 s pre-trigger, so they ended before writing out the audio up to the press; one was empty.
+    - The board had restarted before its counters could be read, so the cause isn't known. The card was also coming and going in its adapter at the time (entry 42).
+  - **After reformatting (6 recordings, 6.5–10.9 s each, 50.2 s and 25.1 MB in all):**
+    - every file passes `check_raw.py` and Python's `wave` module, with every sample a 12-bit code × 16;
+    - no step across a block boundary is bigger than the steps inside blocks;
+    - all stopped with the button (`recLastEnd` 0), and the last file's 6341 blocks match `recBlocks` exactly.
+  - **The pre-trigger lines up.** The RECORD button's click lands at 4.96–4.98 s in two files: the 5.00 s mark, less the 30 ms debounce.
+    - Claps 1–3 s before the press are in the files.
+    - The stop click is 40–50 ms before each file's end: the debounce, plus up to 20 ms while `Recorder_Poll` holds the main loop.
+  - **Measured on the last recording:**
+    - slowest 8-sector write 15.3 ms;
+    - slowest sync 6.1 ms, under the ~10 ms estimate, so at most 0.3% of the time;
+    - most backlog 4917 blocks: the pre-trigger itself, against ~16,300 before audio is lost;
+    - no SD errors or recoveries, no ring faults, CE# worst 5.22 µs, DSP worst 63%.
+  - The DC offset is −48 codes in every file: the bias sits slightly below mid-rail.
+  - **Card removed and put back while running:** records again without a restart, once PB14 has its pull-up (entry 42).
+  - **Still to test:** a recording to the 10-minute limit, a power cut mid-recording (S1), and a recording straight after a playback.
+- **Lessons for future designs:**
+  - Keep file writes sector-aligned from the first byte. A header that doesn't fill a whole sector misaligns everything after it.
+  - Order the steps of a sync so that an interruption leaves a file that under-claims its contents.
+  - A buffer's block numbering can be continuous while its time isn't. Mark the discontinuities.
+
+### 42. Internal pull-up on SD MISO (PB14); the microSD adapter was unreliable (Nov 2)
+- **Decision:** PB14 (SPI2 MISO) uses the G4's internal pull-up, about 40 kΩ, set in CubeMX. V2 has no external pull-up there.
+- **Context:**
+  - The board was started with no card in the slot. The driver didn't report "no card": it reported CMD0 failing with the card "still busy", after a 500 ms wait (`sdBusyMaxUs` 499.7 ms, reply 0x00).
+  - With nothing driving MISO, the pin floats, and here it read low. 0x00 is what a busy card sends, so a missing card looked like a busy one.
+  - Over the same days, the microSD card in its SD adapter kept vanishing and coming back as the card was moved in the adapter.
+- **Why:**
+  - A pull-up makes an undriven MISO read 0xFF, which the driver already treats as "no card". A card that drops out mid-write then fails at once, instead of after a 500 ms busy wait on every attempt.
+  - The SD spec asks for 10–100 kΩ pull-ups on the card's data lines. While the card drives the line, a weak pull-up makes no difference.
+  - Entries 4 and 21 already list an SD MISO pull-up as a hardware lesson. This is the firmware stand-in for V2.
+- **The adapter:**
+  - Intermittent contact fits the "card not found, then found again" behaviour, and possibly the times the card stopped answering until power-cycled (entry 40).
+  - It doesn't explain entry 40's DMA-only fault: polled transfers ran clean on the same card and adapter, in the same build.
+- **Alternatives considered:** a 47 kΩ external resistor on V3 (planned with the hardware fixes). Leaving it floating: rejected, because it turns a missing card into a 500 ms timeout.
+- **Outcome:** the generated change is just PB14's `Pull` in `HAL_SPI_MspInit`, with its speed and alternate function unchanged. Verified on hardware (Nov 2):
+  - **A card removed and put back while the board runs** records again on the next RECORD, with no restart. This is the first hardware test of entry 40's re-initialise-on-the-next-mount path.
+  - **A card pulled during a recording** (`BAT00009`, 223 blocks in):
+    - the card rejected a CMD25 data block, then didn't answer CMD13;
+    - both recovery attempts failed, and the recording ended with "REC: SD error";
+    - the next RECORD with the slot empty showed "REC: no card".
+  - **No 500 ms waits:** the longest busy wait throughout was 19 ms, where the floating MISO would have cost 500 ms per attempt.
+  - **The cost of pulling the card:** a recording that loses its card can't close its file, so the file stays as it was at its last sync. Here that was empty, because the pull came before the first sync at 2 s. The unsynced clusters are lost chains until chkdsk frees them.
+- **Lessons for future designs:**
+  - An input that floats when nothing drives it can read as a valid state. Here 0x00 meant "busy". Give it a pull to the value that means "nothing there".
+  - Avoid card adapters in a device that gets handled: use the slot's native card size.
+
+## 2026-11-03: Species classifier
+
+### 43. Species classifier: modelled on the PC, deferred on the device (Nov 3)
+- **Decision:** Don't build the species classifier in `Docs/Bat Species Classifier.md` (Oct 29) into the V2 firmware.
+  - Keep its numpy model, `Tools/classify.py` (stages 1–3: frames, segmenter, features), as a PC tool for the recordings.
+  - Add stages 4–6 (shape groups, species rules, voting) there, and fit the rules to this detector's own recordings once bats fly again in spring.
+  - Revisit classification on the device only once the PC model has proven accurate on real passes.
+- **Context:**
+  - The doc was written for 500 ksps, the day before the switch to 250 kHz (entry 16). Its frames at 250 kHz are a 128-point FFT with a 64-sample hop: the same 0.512 ms window and 1.95 kHz bins, a frame every 0.256 ms, four per audio block.
+  - There are no bat recordings yet; the recorder's files so far are finger rubs. Few bats fly between about November and March.
+  - The model was tested on the doc's bench signals, made by `Tools/bat_signals.py`:
+    - The noise is shaped from the Oct 30 quiet-room capture: 7.2 codes rms above 10 kHz, plus the capture's steady lines as tones (24.92 kHz at 13.4 codes is the largest).
+    - It matches the capture within 0.3 dB in every 10 kHz band from 10 to 125 kHz.
+- **Why defer (with numbers):**
+  - **RAM:** about 3.6 KB at 128 points (the doc's 5.4 KB was for 256 points), against 848 B free.
+    - The doc hoped the 10 KB CCM SRAM was free. It isn't: the linker script maps all 32 KB as one region, and the CCM is its top 10 KB.
+    - Removing the debug features frees about 0.5 KB (`debug_link` state 328 B, `sd_bench` 196 B). The 8 KB capture buffer is the recorder's now.
+    - The one large source is the waterfall FFT's 6 KB (`cfftRe`, `cfftIm`, `fftMagnitude`), at the price of 1.95 kHz waterfall bins instead of 244 Hz.
+  - **CPU:** the doc's budget assumed CMSIS `arm_rfft_fast_f32`, which was rejected (entry 39).
+    - Scaling the hand-rolled 1024-point frame (216k cycles at `-O2`, interrupts included) by N log N gives 10–19k cycles per 128-point frame.
+    - At 3,906 frames/s that is 23–44% of the CPU, continuously, at interrupt priority. Not measured.
+    - The DSP interrupt already peaks at 63% while recording, and the polled SD writer runs in what is left.
+  - **Microphone:** rated to about 80 kHz, so the lesser horseshoe (105–112 kHz) may never be seen.
+  - **Data:** the rule ranges are literature values. They have to be refitted through this front end, which needs recorded bats.
+- **What the model found:** five changes from the doc, all needed before the bench signals passed.
+  1. **Noise floor bias.** The floor tracker rises 32× slower than it falls (1/2048 against 1/64 per frame), so it settles below the mean noise power: −6.1 dB measured, −7 dB in theory for Gaussian noise.
+     - The peak of 57 noise bins is typically 6.4 dB above the mean. So pure noise read a median 11.4 dB against `t_on` 12 dB: 29,000 false calls a minute with the doc's values.
+     - SNR is now measured against the mean noise (+6 dB, which folds into the threshold constants in C), and `t_off` rises from 6 to 9 dB, which 2% of noise frames reach. 60 s of noise then gave no false calls.
+  2. **Peak frequency.** The bin is chosen on the whitened spectrum (power over floor) but interpolated on the raw power.
+     - When the raw maximum was the neighbouring bin, the parabola's offset clamped at ±0.5 bin, and tracks stuck at half-bin values (26.4 kHz = bin 13.5). It was worst beside the 24.9 kHz line, which raises the floor in its bins.
+     - Fix: step once to a louder raw neighbour, then interpolate. Noctule tails crossing the line now read within 0.4 kHz.
+  3. **Call span.** A call is measured over the frames at or above max(`t_on`, peak − 24 dB). With the doc's relative test alone, a noise frame at the end of a call became its end frequency (29 kHz on a 20 kHz call).
+  4. **Characteristic frequency.** The doc takes the flattest single step in the last 40%. On a QCF tail every step is about as flat, so noise picked the point: 24.0–25.1 kHz on a 25 → 24 kHz tail. It's now the end of the flattest part: the slope is fitted over 4 frames (0.77 ms) and the latest minimum wins.
+  5. **Known limit.** A frame's frequency is the centre of the part of the call inside its window, which at the ends is 0.25–0.35 ms inside the call.
+     - A 100 → 30 kHz sweep in 3 ms reads 57–63 kHz of bandwidth; the pipistrelle's 70 kHz start reads about 65.
+     - Rules on bandwidth or start frequency (the doc's Natterer's rule, bandwidth ≥ 80 kHz) must be fitted to this measure.
+- **Outcome** (bench signals at +20 dB re the noise rms above 10 kHz; `python -I Tools/classify.py --selftest` passes):
+  - Every call found in all six sets, none split.
+  - 82 kHz tone: peak within 0.01 kHz, duration −0.6 ms.
+  - Pipistrelle and noctule characteristic frequency within 0.6 kHz.
+  - A 40 kHz tone 10 dB above the calls is whitened out; the calls under it are all found.
+  - Pipistrelle found 20/20 at −5 dB re the noise rms (a 4-code amplitude), 1/20 at −10 dB.
+  - Echoes show up as extra calls; the doc's stage 6 rejects them.
+  - The model runs at about 2.7 s per minute of audio.
+- **Alternatives considered:**
+  - **Build it anyway, taking the waterfall FFT's RAM:** possible, but the CPU cost is unmeasured and likely to collide with recording, and there's no data to fit the rules. Rejected for now.
+  - **Classify on demand:** after a pass, run the classifier over the PSRAM ring in the main loop, borrowing the recorder's 8 KB buffer while it isn't recording. It needs no real-time CPU and fits the RAM. The first option if on-device ID is revisited.
+  - **A larger part on V3,** for example an STM32G474 (128 KB RAM) in LQFP48. Pin compatibility with the G431 to be checked.
+- **Lessons for future designs:**
+  - Model a detector on the PC against the device's measured noise before porting it. Thresholds written to an estimator's nominal meaning can sit inside its noise.
+  - A minimum-tracking floor reads below the mean noise, and the peak of N noise bins reads about ln N above it. Set thresholds against both.
+  - Pick a spectral peak and interpolate it on the same spectrum, or re-centre before interpolating.
+  - Budget RAM from the linker map, not the part's headline numbers: the G431's CCM is part of its 32 KB.
+
 ---
 
 ## Planned decisions (agreed, not built yet)
 
 ### P1. Reclaim about 8 KB of RAM: built, see entries 26–29.
 
-### P2. PSRAM as the recording buffer, written from the interrupt side (ring built, entry 34; SD writer planned)
+### P2. PSRAM as the recording buffer, written from the interrupt side (ring built, entry 34; SD writer built, entry 41)
 - **Plan:** PSRAM writes must never wait on the main loop, which may be stuck inside an SD write. So one interrupt-driven, DMA-driven SPI1 engine owns the PSRAM.
   - It uses DMA2, away from the audio channels on DMA1.
   - Bursts are 32 bytes at most, which is about 7 µs at wire speed. (Built with 16-byte bursts for margin; entry 36.)
@@ -733,6 +885,15 @@ Entries are in order, with the newest at the bottom. Decisions that are agreed b
 - Measure an optimisation's gain before chasing a fault in it (entry 40).
 - Without CRC, an SD card that misses a start token writes a shifted block silently: probe abnormal responses and verify data on the PC (entry 40).
 - Power-cycle an SD card between failing tests; CMD0 alone may not bring it back (entry 40).
+- Keep file writes sector-aligned from the first byte: pad headers to a whole sector (entry 41).
+- Order a sync so that an interruption leaves a file that under-claims its contents (entry 41).
+- A buffer's block numbers can run on while its time doesn't (a pause): mark the gaps (entry 41).
+- Pull a floating input to the value that means "nothing there"; on SD MISO a floating 0x00 reads as "busy" (entry 42).
+- Avoid card adapters in a handheld device; use the slot's native card size (entry 42).
+- Model a detector on the PC against the device's measured noise before porting it; the design's thresholds sat inside the noise (entry 43).
+- A minimum-tracking floor reads below the mean noise, and the peak of N noise bins about ln N above it: set thresholds against both (entry 43).
+- Pick a spectral peak and interpolate it on the same spectrum, or re-centre first (entry 43).
+- Budget RAM from the linker map: the G431's 10 KB CCM is part of its 32 KB (entry 43).
 
 ---
 
