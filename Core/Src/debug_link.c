@@ -56,6 +56,7 @@
 #include "sd_bench.h"
 #include "sd_spi.h"
 #include "usbd_cdc_if.h"
+#include "../DSP/autotune.h"
 #include "../DSP/bat_detect.h"
 #include "../DSP/fft.h"
 #include "../DSP/playback.h"
@@ -274,6 +275,11 @@ static const DebugStat_t debugStats[] =
     { "recMaxSyncUs",           'u', &recMaxSyncUs },
     { "recReadFailures",        'u', &recReadFailures },
     { "recLastEnd",             'u', &recLastEnd },
+
+    /* Auto-tune (autotune.h) */
+    { "autoTuneCalls",          'u', &autoTuneCalls },
+    { "autoTuneRetunes",        'u', &autoTuneRetunes },
+    { "autoTuneLastHz",         'u', &autoTuneLastHz },
 
     /* Bat detector */
     { "batEnergyDb",            'f', &batEnergyDb },

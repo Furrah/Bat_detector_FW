@@ -35,7 +35,8 @@ HIGH_PASS_HZ = 10000.0
 
 # bat_detect.c parameters: keep these in step with the firmware
 DETECTOR = {
-    "threshold_db": 10.0,
+    "threshold_db": 12.0,
+    "trigger_pulses": 3,
     "pulse_max_ms": 100,
     "noise_run_ms": 150,
     "trigger_window_ms": 600,
@@ -329,9 +330,12 @@ def replay_detector(energy, floor_start, block_us, threshold_db):
     floor = f32(floor_start)
     floors = np.empty(len(energy), dtype=np.float32)
     runs = []
+    need = DETECTOR["trigger_pulses"]
+
     pulses = triggers = noise_runs = 0
     run = since = hold = 0
-    have_pulse = present = False
+    chain = 0                   # pulses in a row, each within the window of the last
+    present = False
 
     for i, e in enumerate(energy):
         if e > floor * threshold:
@@ -345,13 +349,13 @@ def replay_detector(energy, floor_start, block_us, threshold_db):
                 runs.append((i - run, run))
                 if run <= pulse_max:
                     pulses += 1
+                    chain = min(chain + 1, need) if (chain > 0 and since <= window) else 1
                     if present:
                         hold = hold_blocks
-                    elif have_pulse and since <= window:
+                    elif chain >= need:
                         present = True
                         hold = hold_blocks
                         triggers += 1
-                    have_pulse = True
                     since = 0
                 run = 0
 

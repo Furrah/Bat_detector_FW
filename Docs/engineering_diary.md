@@ -801,6 +801,101 @@ Entries are in order, with the newest at the bottom. Decisions that are agreed b
   - Pick a spectral peak and interpolate it on the same spectrum, or re-centre before interpolating.
   - Budget RAM from the linker map, not the part's headline numbers: the G431's CCM is part of its 32 KB.
 
+## 2026-11-03: Detector LEDs and auto-tune
+
+### 44. Detector: +12 dB, three pulses to a pass, LED1 only during a pass; finger rubs still trigger it (Nov 3)
+- **Decision:**
+  - Raise the bat detector's threshold from 10 to 12 dB above its floor.
+  - Need three pulses, each within 600 ms of the one before, to start a pass (it was two).
+  - Flash LED1 for a call only while a pass is in progress.
+- **Context:** Both LEDs were firing with no bats about, and rubbing fingers together 50 cm from the microphone triggers a pass.
+- **Why (with numbers):** The Oct 30 quiet-room capture (entry 33, one minute of block energies) was replayed through the detector with each threshold and trigger rule. No bats were present, so every pulse and pass is false.
+
+  | Threshold | False pulses/min | False passes/min (2 / 3 / 4 pulses) | LED0 lit (2 / 3 / 4 pulses) |
+  |---|---|---|---|
+  | +10 dB (was) | 57 | 6 / 2 / 2 | 59% / 32% / 28% |
+  | +11 dB | 24 | 3 / 1 / 0 | 11% / 3% / 0% |
+  | +12 dB (now) | 11 | 0 / 0 / 0 | 0% |
+  | +13 dB | 3 | 0 / 0 / 0 | 0% |
+
+  - The 59% explains the complaint: in that room LED0 was on more often than off.
+  - **Three pulses:** each extra pulse multiplies the chance of random pulses chaining into a pass by the chance of another within 600 ms, about 0.1 at 11 a minute. So it makes false passes about 10× rarer. A real pass pays one more call interval, 0.1–0.2 s at 5–10 calls a second.
+  - **LED1:** the 11 remaining false pulses a minute no longer flash it, because LED1 only shows the calls of a pass.
+- **Finger rubs are not fixed by this, and can't be by a threshold.**
+  - Rubbing fingers makes real broadband ultrasound; it's the usual way to test a bat detector. At 50 cm it is far above any sensible threshold.
+  - The detector measures only the energy above 10 kHz, so a rub and a call look the same to it.
+  - Telling them apart needs a feature that differs in shape, not level: a call is a tone or a sweep, a rub is broadband hiss.
+  - Next: design that test on the PC first, as in entry 43, against the finger-rub recordings on the SD card and the synthetic calls (`Tools/bat_signals.py`).
+- **Limits found while modelling auto-tune (entry 45):**
+  - A pipistrelle at +12 dB relative to the noise isn't detected at all, though at +20 dB it is. The 24.95 kHz line makes up 76% of the detector's input energy (entry 33). By comparison, entry 43's 128-point whitened frames found the same call at −5 dB.
+  - A steady 40 kHz tone 10 dB louder than the calls (a bush cricket) hides them completely.
+  - Both point the same way as the finger rubs: a detector that looks at the spectrum, not just the band energy.
+- **Alternatives considered:**
+  - +15 dB: no false pulses in the capture either, but 3 dB less sensitive than +12 for no measured gain.
+  - Four pulses: no better than three at +12 dB, and slower.
+- **Outcome:** built (`bat_detect.c`, `main.c`'s LED code), and `analyse_capture.py`'s replay updated to match. Replays of captures recorded before this change will now disagree with the board's counters.
+  - **On the board (Nov 3), at the desk**, a 20 s energy capture (`20261103_093947_energy_desk-nov3`) showed 180 pulses a minute, in irregular clusters. They peaked 37–40 dB above the floor, with almost all their energy above 10 kHz: desk sounds such as typing and handling, which are rich in ultrasound.
+  - The replayed sweep still gave 3 passes a minute at every threshold from +6 to +20 dB. That confirms it: what's left is loud real ultrasound, for the shape test to reject, not a threshold to tune.
+- **Lessons for future designs:**
+  - A threshold sets the false-alarm rate on background noise. It can't reject a loud sound that isn't a bat; that takes a feature that differs between the two.
+  - Replay recorded data through every candidate rule before choosing one: the 59% came from the data, not from an estimate.
+
+### 45. Auto-tune, and tuning modes on a long PLAYBACK press (Nov 3)
+- **Decision:**
+  - Add auto-tune (`Core/DSP/autotune.c`), which points the heterodyne LO at the bats being heard.
+  - Holding PLAYBACK for 0.8 s switches between manual tuning (the knob) and auto. A short press still plays back, but now acts on release.
+- **How auto-tune works:**
+  - **Its input:** the waterfall's rows. Every 40 ms each row holds the peak level in each of its 240 columns (about 0.52 kHz each), so auto-tune needs no FFT of its own and no frame buffer.
+  - **A noise floor per column**, learnt only between passes:
+    - It falls fast (a quarter of the way per row) and rises 0.5 dB every fourth row, so it sits near the quiet end of the noise.
+    - A steady tone, such as the 24.95 kHz line or a cricket, becomes part of its column's floor and can't win.
+    - It's stored as int8 in half-dB steps: 240 B, against 960 B as floats.
+  - **During a pass**, each row with a call gives the column furthest above its floor (at least 10 dB, 10–120 kHz).
+    - It steps to a louder neighbour before interpolating between columns, the lesson of entry 43.
+    - That gives the call's loudest frequency to about 0.1 kHz.
+  - **Setting the LO:**
+    - The LO goes 1.5 kHz below the median of the last 8 calls, so a pipistrelle's 45 kHz tail beats at an audible 1.5 kHz rather than near 0 Hz.
+    - It moves only for a change of more than 2 kHz, at most once a second, in 0.1 kHz steps, and it holds between passes.
+    - Each pass starts from its own calls.
+- **The modes:**
+  - **Manual:** the knob sets the LO, as before.
+  - **Auto:** the header shows "AUTO 43.5kHz" and the knob is ignored, so a knock in a pocket can't retune it.
+  - **Switching:** auto starts from the current LO and moves when the bats do; going back to manual returns to the knob's position.
+  - A "MODE: AUTO" or "MODE: MANUAL" message shows for 2 s. The board starts in manual.
+  - Auto-tune learns in both modes, so it's ready the moment auto is selected.
+- **Model, before the board:** auto-tune was ported line for line to Python and fed synthetic calls in the board's noise. The pipeline was the detector at its entry-44 settings, then 1024-point frames, then the waterfall's columns and rows.
+
+  | Signal | Calls measured (median) | LO set to |
+  |---|---|---|
+  | Pipistrelle, 70 → 45 kHz | 45.6 kHz | 44.4 kHz, 0.4 s into the pass |
+  | Greater horseshoe, 82 kHz CF | 82.1 kHz | 80.6 kHz |
+  | Noctule, tails alternating 20 / 24 kHz | both notes | 19.4–24.1 kHz, one note or between |
+  | *Myotis* sweep 100 → 30 kHz | 41–69 kHz | 55–68 kHz |
+  | Noise only | none | never moves |
+
+  - **Dropped frames:** the FFT drops about 20% of its blocks normally and about half while recording (entry 39).
+    - With 20% or 50% of frames dropped at random, the pipistrelle and horseshoe tuned the same in every run.
+    - With recorder-like bursts of 3–5 dropped frames, 1 run in 30 tuned to 57.5 kHz: the kept frames held only the calls' opening sweep.
+    - The first test dropped exactly every other frame, which locks onto the call rhythm and failed far more often. That was an artefact of the test.
+  - **The *Myotis* spread** comes from the synthetic sweep being equally loud along its length. Real calls have a peak-energy frequency.
+- **Costs:** 1.8 KB of flash and 304 B of RAM (about 540 B left). The CPU cost is negligible: 25 rows a second in the main loop.
+- **Alternatives considered:**
+  - The classifier's tuner (doc, entry 43): parked with the classifier.
+  - A separate FFT for auto-tune: no RAM for it.
+  - Tuning to the peak itself (offset 0): a QCF tail would beat near 0 Hz, inaudible.
+  - Freezing auto-tune while recording: rejected; 1 mis-tune in 30 runs isn't worth losing the tracking.
+  - Voting only with the strongest calls: tried, no help. When the frames miss a stretch of tails, there's nothing strong to vote for.
+- **Limits:**
+  - It hears only what the detector calls a pass, so entry 44's sensitivity limits apply (quiet bats, loud insects).
+  - FM bats tune somewhere along their sweep, wherever the energy peaks.
+- **Outcome:** built. `capture.py stats` shows `autoTuneCalls`, `autoTuneRetunes` and `autoTuneLastHz`.
+  - **On the bench (Nov 3):** auto-tune works. Driven by finger rubs and desk sounds for 15 minutes, it measured 1,782 calls and moved the LO 110 times, at most once a second as designed. The mode switch and the "AUTO" label work.
+  - Other counters were unaffected: DSP peak 44%, CE# 4.77 µs, no ring or SD faults, and 20.6% of FFT blocks dropped (the usual 20%).
+  - How accurately it tunes on real bats waits for a field test in spring. Until then, the model above is the evidence.
+- **Lessons for future designs:**
+  - Feed a new feature from data another module already computes before adding a pipeline for it. Here the waterfall's rows saved an FFT and 2 KB of RAM.
+  - Test against realistic data loss. A drop pattern that locks onto the signal's rhythm exaggerates failures (1 in 6 against 1 in 30), and real call intervals vary anyway.
+
 ---
 
 ## Planned decisions (agreed, not built yet)
@@ -833,8 +928,8 @@ Entries are in order, with the newest at the bottom. Decisions that are agreed b
 - **The detector:**
   - It uses the energy of the existing 10 kHz high-pass output, which costs about 0.5% CPU.
   - A noise floor follows the energy down quickly and up slowly.
-  - Pulses are 1–100 ms runs more than 10 dB above the floor; runs longer than 150 ms count as noise.
-  - Two pulses within 600 ms switch the amp on, and it stays on for 2 s after the last pulse.
+  - Pulses are 1–100 ms runs more than 12 dB above the floor (10 dB until entry 44); runs longer than 150 ms count as noise.
+  - Three pulses, each within 600 ms of the one before (two until entry 44), switch the amp on, and it stays on for 2 s after the last pulse.
   - The timings come from `Docs/European Bat Calls — Species, Frequencies & Acoustic ID.md`: call lengths of 0.8–30 ms (tens of ms for horseshoes), and up to 468 ms between greater noctule calls.
   - A 10 kHz lower band edge keeps the free-tailed bat (9–14 kHz) and social calls (14–22 kHz).
 - **Honest benefit:** The amp draws about 4 mA of an estimated 60–100 mA system total, so it's a few % of battery life. The bigger gain is silence instead of hiss between bats.
@@ -894,6 +989,10 @@ Entries are in order, with the newest at the bottom. Decisions that are agreed b
 - A minimum-tracking floor reads below the mean noise, and the peak of N noise bins about ln N above it: set thresholds against both (entry 43).
 - Pick a spectral peak and interpolate it on the same spectrum, or re-centre first (entry 43).
 - Budget RAM from the linker map: the G431's 10 KB CCM is part of its 32 KB (entry 43).
+- A threshold sets the false-alarm rate on background; rejecting loud non-bat sounds needs a feature that differs in shape, not level (entry 44).
+- Replay recorded data through every candidate rule before choosing one (entry 44).
+- Feed a new feature from data another module already computes before adding a pipeline (entry 45).
+- Test against realistic data loss: a pattern that locks onto the signal's rhythm exaggerates failures (entry 45).
 
 ---
 

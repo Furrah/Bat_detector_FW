@@ -72,4 +72,15 @@ void Waterfall_Accumulate(const float *mag_linear, uint16_t n_bins);
 // the accumulated peak row to the display and resets the accumulator.
 void Waterfall_FlushRow(void);
 
+// The row being accumulated: each column's peak level in dB (columns with
+// nothing louder sit at the palette floor), and in *frames how many FFT
+// frames went into it (0 when the main loop had no time for the FFT).
+// Read it just before Waterfall_FlushRow, which clears it. Used by
+// auto-tune (autotune.h).
+const float *Waterfall_GetRow(uint16_t *frames);
+
+// The absolute frequency (Hz) of a screen column; a fractional column
+// interpolates. Matches Waterfall_Accumulate's mapping of bins to columns.
+float Waterfall_ColumnToHz(float column);
+
 #endif /* DISPLAY_WATERFALL_H_ */

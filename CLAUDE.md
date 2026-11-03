@@ -16,8 +16,8 @@ Handheld, battery-powered ultrasonic bat detector covering the 20–120 kHz echo
 
 - CubeMX-generated files: only edit inside `/* USER CODE BEGIN */ … /* USER CODE END */` blocks. Anything outside is wiped when the .ioc is regenerated.
 - Make incremental, targeted changes scoped to the function or module in question, with the rationale stated. No whole-file rewrites.
-- RAM: 848 B free with the USB debug capture, the PSRAM ring, playback, the SD write test and the WAV recorder built in (31.2 KB used, including a 2 KB stack, a 0.5 KB heap reservation, 1 KB of PSRAM-ring interrupt code that runs from RAM, and playback's 1 KB of block buffers). The debug capture's 8 KB buffer is shared with the recorder and the SD test, so `DEBUG_CAPTURE 0` in `debug_link.h` no longer frees it; it frees only the module's code and ~0.5 KB of its state. No malloc, no large stack buffers.
-- Flash: 90.3 KB of 128 KB used at `-Og` (95 KB at `-O0` before the capture module). Large constant tables belong in flash rather than RAM.
+- RAM: about 540 B free with the USB debug capture, the PSRAM ring, playback, the SD write test, the WAV recorder and auto-tune built in (31.5 KB used, including a 2 KB stack, a 0.5 KB heap reservation, 1 KB of PSRAM-ring interrupt code that runs from RAM, and playback's 1 KB of block buffers). The debug capture's 8 KB buffer is shared with the recorder and the SD test, so `DEBUG_CAPTURE 0` in `debug_link.h` no longer frees it; it frees only the module's code and ~0.5 KB of its state. No malloc, no large stack buffers.
+- Flash: 92.1 KB of 128 KB used at `-Og` (95 KB at `-O0` before the capture module). Large constant tables belong in flash rather than RAM.
 - Interrupt priorities: DMA2 Channel 1 (the PSRAM ring's burst interrupt) must be the only interrupt at priority 0; everything else at 1 or lower. `PsramRing_Start()` refuses to run otherwise (boot screen: "Ring: NVIC prio"). Diary entry 34.
   - CubeMX defaults a newly enabled peripheral interrupt to priority 0. It did that to SPI2's global interrupt (Nov 2); check every new interrupt's priority after generating.
   - `__disable_irq()` blocks priority 0 too. Keep masked sections in code that runs while the ring is busy to a few dozen instructions: a masked section that delays a burst's end stretches CE#. Bursts have ~3.5 µs of slack (entry 36).
@@ -77,10 +77,17 @@ Unused: PA7, PA10, PA15, PB1, PB9, PC13.
   - Since Nov 2 `fft.c` builds at `-O2` via a `#pragma` (as `psram_ring.c` does), and the bit reversal uses the `RBIT` instruction instead of a loop. CMSIS-DSP was considered and rejected: `arm_rfft_fast_f32` needs a 4 KB output buffer that doesn't fit.
 - `bat_detect.c` (Core/DSP): bat-call detector, stage 1 (monitor only; the amp stays on).
   - Runs once per block from `DSP_ProcessBlock`, on the energy of the 10 kHz high-pass output.
-  - Tracks the noise floor, finds pulses (1–100 ms long, more than 10 dB above the floor), and triggers on 2 pulses within 600 ms, with a 2 s hold.
-  - LED0 = bat pass in progress; LED1 = 50 ms flash per pulse. These replace V1's LO-band LEDs.
+  - Tracks the noise floor, finds pulses (1–100 ms long, more than 12 dB above the floor), and starts a pass on 3 pulses, each within 600 ms of the one before, with a 2 s hold.
+  - LED0 = bat pass in progress; LED1 = a 50 ms flash per call during a pass (pulses outside a pass stay dark). These replace V1's LO-band LEDs.
   - Live Expressions: `batEnergyDb`, `batFloorDb`, `batPulses`, `batTriggers`, `batNoiseRuns`, `batPresent`.
-  - Parameter reasoning is in diary entry 30.
+  - Parameter reasoning is in diary entries 30 and 44. Since Nov 3 it's +12 dB and 3 pulses: in the quiet-room replay, +10 dB and 2 pulses kept LED0 lit 59% of the time.
+  - Known limit: finger rubs and desk sounds such as typing (real broadband ultrasound, up to 40 dB above the floor) still trigger it. The band energy can't tell a rub from a call, so it needs a tonality test, still to be designed on the PC from the finger-rub WAVs (diary 44). It also misses quiet bats (+12 dB re noise) and calls under a loud steady tone.
+- `autotune.c` (Core/DSP): auto-tune, built Nov 3 (diary 45). It works on the bench (driven by finger rubs: 1,782 calls measured, 110 LO moves in 15 min); accuracy on real bats needs a field test.
+  - Fed from the waterfall's rows (`Waterfall_GetRow`, 240 columns of ~0.52 kHz every 40 ms), with a per-column noise floor learnt between passes, so steady tones never win.
+  - During a pass, each row with a call gives the column furthest above its floor. The LO goes `AUTOTUNE_OFFSET_HZ` (1.5 kHz) below the median of the last 8 calls; it moves only for more than 2 kHz, at most once a second, and holds between passes.
+  - Modes: hold PLAYBACK for 0.8 s to switch between manual (the knob sets the LO) and auto ("AUTO 43.5kHz" in the header; the knob is ignored). A short PLAYBACK press acts on release. Starts in manual.
+  - Model of the chain on synthetic calls (diary 45): pipistrelle → LO 44.4 kHz, horseshoe 82 → 80.6 kHz, noise → no move; 1 mis-tune in 30 runs with recorder-like frame drops.
+  - Stats: `autoTuneCalls`, `autoTuneRetunes`, `autoTuneLastHz`.
 - `debug_link.c` (Core/Src; header in Core/Inc so dsp.c and the USB code can include it): USB CDC debug capture, built 2026-10-30.
   - The PC sends one byte: `I` info, `R` a raw 4096-sample snapshot, `E` / `S` start / stop one energy record per block. Replies are CRC-32 framed; the format is at the top of `debug_link.c`.
   - Also: `M` ring read-back, `N` / `T` the stats table and its values, `Z` restart the worst-case timings, `W` + pre-trigger, sectors-per-write and DMA (0/1) bytes start the SD write test (`S` stops it), `F` capture one FFT frame and its result.
@@ -116,7 +123,7 @@ Unused: PA7, PA10, PA15, PB1, PB9, PC13.
   - Verify with `python -I Tools/capture.py verify --count 50`: debug link `M` reads the last snapshot back from the ring and the PC compares it bit for bit. It fails while playback has the ring paused.
   - `PsramRing_SetPaused()` stops recording (reads still run); `PsramRing_GetWrittenBlocks()` gives the newest readable block + 1.
   - Block numbers carry straight on across a pause. `PsramRing_GetResumeBlock()` gives the first block after the last one, so a pre-trigger never joins audio from either side of a playback.
-- `playback.c` (Core/DSP): time-expansion playback, verified on hardware 2026-10-30 (diary 37). PLAYBACK replays the last `PLAYBACK_SECONDS` (2 s) from the ring `PLAYBACK_EXPANSION` (10, in `pipeline_config.h`) times slower; press again to stop.
+- `playback.c` (Core/DSP): time-expansion playback, verified on hardware 2026-10-30 (diary 37). PLAYBACK replays the last `PLAYBACK_SECONDS` (2 s) from the ring `PLAYBACK_EXPANSION` (10, in `pipeline_config.h`) times slower; press again to stop. Since Nov 3 a short press acts on release, because holding PLAYBACK for 0.8 s switches the tuning mode (`autotune.c`).
   - Linear interpolation at the full 250 kHz DAC rate, after the same 10 kHz high-pass as the heterodyne. Replaces the heterodyne output while active (`DSP_ProcessBlock`); detector and waterfall stay live.
   - The ring is paused during playback and resumes when it ends. Two 512-byte slots: one plays while the next block loads.
   - Live Expressions: `playbackUnderruns` (should stay 0). The display shows "PLAY 10x  20s" in place of the LO readout.
@@ -185,6 +192,7 @@ Bugs already fixed — do not reintroduce:
   3. SD bring-up. Done (Nov 2, diary 38–40): format, mount, recovery, and 8-sector polled writes keeping up under full recording load, with the data verified on the PC.
   4. RAM reclaim (done Oct 30), then the DMA-driven PSRAM ring buffer (verified Oct 30), then WAV recording to SD (verified Nov 2; long-run and power-cut tests still to do).
   5. Time-expansion playback from PSRAM on PLAYBACK. Version 1 built (fixed 10×, last 2 s). Next: start at the detector's last bat pass; a knob-set factor.
+- Detector tonality test (diary 44): finger rubs still trigger passes. Design a shape test (a call is a tone or a sweep, a rub is broadband) on the PC against the finger-rub WAVs and `Tools/bat_signals.py`, then port it. It should also help with quiet bats and calls under insects.
 - Amplifier gating ("squelch"): switch `AMP_EN` on only while bats are detected.
   - Stage 1 (the monitor-only detector) is built; tune it in the field first.
   - Stage 2: drive `AMP_EN` from it, with a fade, amp off at zero volume, and forced on during playback.

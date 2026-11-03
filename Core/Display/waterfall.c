@@ -8,6 +8,7 @@
 static uint16_t s_scroll_pos  = 0;             // 0..WF_VSA-1, position within scroll area
 static uint16_t s_row_buf[WF_SCREEN_W];        // one scanline, ready for ILI9341_DrawImage
 static float    s_peak_db[WF_SCREEN_W];        // running peak-hold accumulator, per column
+static uint16_t s_row_frames  = 0;             // FFT frames in the accumulator so far
 static float    s_floor_db = -60.0f;
 static float    s_ceil_db  =   0.0f;
 static uint32_t s_lo_freq_hz = 0;
@@ -21,6 +22,7 @@ static void ResetAccumulator(void) {
     for (uint16_t i = 0; i < WF_SCREEN_W; i++) {
         s_peak_db[i] = s_floor_db;
     }
+    s_row_frames = 0;
 }
 
 void Waterfall_Init(void) {
@@ -181,6 +183,25 @@ void Waterfall_Accumulate(const float *mag_linear, uint16_t n_bins) {
             s_peak_db[col] = group_peak_db;
         }
     }
+
+    s_row_frames++;
+}
+
+const float *Waterfall_GetRow(uint16_t *frames) {
+    *frames = s_row_frames;
+    return s_peak_db;
+}
+
+float Waterfall_ColumnToHz(float column) {
+    // Waterfall_Accumulate's mapping: column c peak-holds the bins from
+    // WF_SKIP_BINS + c * usable / WF_SCREEN_W up to (not including) the
+    // next column's first; this is the middle of that range. The FFT is of
+    // the raw ADC, so the frequency is absolute (no LO offset).
+    const float bin_width_hz = (float)WF_SAMPLE_RATE_HZ / (float)WF_FFT_LENGTH;
+    const float usable_bins  = (float)(WF_FFT_LENGTH / 2 + 1 - WF_SKIP_BINS);
+    const float bin = (float)WF_SKIP_BINS + (column + 0.5f) * usable_bins / (float)WF_SCREEN_W - 0.5f;
+
+    return bin * bin_width_hz;
 }
 
 void Waterfall_FlushRow(void) {

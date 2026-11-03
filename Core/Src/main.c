@@ -30,6 +30,7 @@
 #include "adc.h"
 #include "dsp.h"
 #include "bat_detect.h"
+#include "autotune.h"
 #include "playback.h"
 #include "debug_link.h"
 #include "sd_bench.h"
@@ -82,6 +83,17 @@
 #define LABEL_PLAYBACK           0x10000U   // + seconds left
 #define LABEL_RECORDING          0x20000U   // + seconds recorded
 
+// PLAYBACK held this long (10 ms ticks) switches the tuning mode
+#define LONG_PRESS_TICKS         80U
+
+// Tuning modes, in the order a long PLAYBACK press steps through them
+#define TUNE_MANUAL              0U      // the LO knob sets the LO
+#define TUNE_AUTO                1U      // auto-tune follows the bats (autotune.h)
+#define TUNE_MODES               2U
+
+// A knob reading that can't happen: the next real one is applied
+#define KNOB_UNREAD              0xFFFFU
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -127,7 +139,8 @@ static void MX_TIM2_Init(void);
 static void MX_SPI1_Init(void);
 static void MX_RTC_Init(void);
 /* USER CODE BEGIN PFP */
-static void ShowLoLabel(uint32_t frequency);
+static void ShowLoLabel(uint8_t mode, uint32_t frequency);
+static void SetLo(uint32_t frequency);
 
 /* USER CODE END PFP */
 
@@ -440,6 +453,7 @@ int main(void)
   ADC_Init();
   DSP_Init();
   BatDetect_Init();
+  AutoTune_Init();
   DAC_Init();
   FFT_Init();
 
@@ -519,10 +533,13 @@ int main(void)
   // (PLAYBACK: SD speed, RECORD: full PSRAM) has to be released before it counts
   uint8_t playbackButton = 1;
   uint8_t playbackDebounce = 0;
+  uint32_t playbackHeldTicks = 0;
+  uint8_t playbackLongDone = 1;         // this press is used up (a long press, or the power-up one)
   uint8_t recordButton = 1;
   uint8_t recordDebounce = 0;
   uint32_t headerLabel = LABEL_LO;      // LABEL_...: what the LO readout's spot shows
   uint32_t messageUntil = 0;            // a message stays up until this tick
+  uint8_t tuneMode = TUNE_MANUAL;       // TUNE_...: who sets the LO
 
   Waterfall_SetLOFrequency(frequency);
 
@@ -550,24 +567,26 @@ int main(void)
 
 	        ADC2_StartScan();
 
-	        if(abs((int)adc - (int)lastADC) > 16)
+	        // The LO knob tunes in manual mode only; auto ignores it
+	        if((tuneMode == TUNE_MANUAL) && (adc != KNOB_UNREAD) && (abs((int)adc - (int)lastADC) > 16))
 	        {
 	            frequency =((uint32_t)adc * AUDIO_LO_MAX_HZ) / 4095U;
 
-	            DSP_SetMixerFrequency((float)frequency);
-	            LO_SetFrequency(frequency);
+	            SetLo(frequency);
 
 	            lastADC = adc;
 
 	            // a message, playback or recording label has the spot while it's up
 	            if(headerLabel == LABEL_LO)
 	            {
-	                ShowLoLabel(frequency);
+	                ShowLoLabel(tuneMode, frequency);
 	            }
 	        }
 
-	        // PLAYBACK: replay the last 2 s ten times slower; press again to stop.
-	        // Not while a recording is open: playback pauses the ring it reads from.
+	        // PLAYBACK, short press: replay the last 2 s ten times slower, or stop.
+	        // It acts on release, so it can be told from a long press. Not while a
+	        // recording is open: playback pauses the ring it reads from.
+	        // PLAYBACK held for 0.8 s: the next tuning mode (manual, auto).
 	        uint8_t playbackDown = (HAL_GPIO_ReadPin(PLAYBACK_BUTTON_GPIO_Port, PLAYBACK_BUTTON_Pin) == GPIO_PIN_RESET);
 
 	        if(playbackDown == playbackButton)
@@ -579,11 +598,16 @@ int main(void)
 	            playbackButton = playbackDown;
 	            playbackDebounce = 0;
 
-	            if(playbackButton && Playback_IsActive())
+	            if(playbackButton)
+	            {
+	                playbackHeldTicks = 0;          // pressed: time the hold
+	                playbackLongDone = 0;
+	            }
+	            else if(!playbackLongDone && Playback_IsActive())
 	            {
 	                Playback_Stop();
 	            }
-	            else if(playbackButton)
+	            else if(!playbackLongDone)
 	            {
 	                Playback_Status_t status = (Recorder_GetState() != RECORDER_IDLE) ? PLAYBACK_ERR_BUSY : Playback_Start();
 
@@ -597,6 +621,26 @@ int main(void)
 	                    messageUntil = lastRead + LABEL_MESSAGE_MS;
 	                }
 	            }
+	        }
+
+	        if(playbackButton && !playbackLongDone && (++playbackHeldTicks >= LONG_PRESS_TICKS))
+	        {
+	            playbackLongDone = 1;
+	            tuneMode = (uint8_t)((tuneMode + 1U) % TUNE_MODES);
+
+	            if(tuneMode == TUNE_AUTO)
+	            {
+	                AutoTune_Restart(frequency);    // the LO stays put until the bats move it
+	            }
+	            else
+	            {
+	                lastADC = KNOB_UNREAD;          // back to the knob's setting on its next reading
+	            }
+
+	            ILI9341_WriteString(5, 5, (tuneMode == TUNE_AUTO) ? "MODE: AUTO   " : "MODE: MANUAL ",
+	                    Font_16x26, ILI9341_WHITE, ILI9341_BLACK);
+	            headerLabel = LABEL_MESSAGE;
+	            messageUntil = lastRead + LABEL_MESSAGE_MS;
 	        }
 
 	        // RECORD: record to SD from 5 s before the press; press again to stop.
@@ -696,11 +740,12 @@ int main(void)
 	        else if(headerLabel != LABEL_LO)
 	        {
 	            headerLabel = LABEL_LO;
-	            ShowLoLabel(frequency);
+	            ShowLoLabel(tuneMode, frequency);
 	        }
 
 	        // Bat detector, stage 1 (monitor only, the amp stays on):
-	        // LED0 = bat pass in progress, LED1 = flash for each bat-like pulse
+	        // LED0 = bat pass in progress, LED1 = a flash for each call during a
+	        // pass (pulses outside a pass stay dark)
 	        HAL_GPIO_WritePin(LED0_GPIO_Port, LED0_Pin,
 	                BatDetect_IsBatPresent() ? GPIO_PIN_SET : GPIO_PIN_RESET);
 
@@ -709,8 +754,12 @@ int main(void)
 	        if(pulseCount != lastPulseCount)
 	        {
 	            lastPulseCount = pulseCount;
-	            pulseLedOffTick = lastRead + PULSE_LED_MS;
-	            HAL_GPIO_WritePin(LED1_GPIO_Port, LED1_Pin, GPIO_PIN_SET);
+
+	            if(BatDetect_IsBatPresent())
+	            {
+	                pulseLedOffTick = lastRead + PULSE_LED_MS;
+	                HAL_GPIO_WritePin(LED1_GPIO_Port, LED1_Pin, GPIO_PIN_SET);
+	            }
 	        }
 	        else if((int32_t)(lastRead - pulseLedOffTick) >= 0)
 	        {
@@ -737,6 +786,22 @@ int main(void)
 
 	    uint32_t now = HAL_GetTick();
 	    if ((now - last_flush_tick) >= 40) {
+	        uint16_t rowFrames;
+	        uint32_t tunedHz;
+
+	        // auto-tune reads the row before it's drawn and cleared; it learns
+	        // in both modes but only moves the LO in auto
+	        if(AutoTune_AddRow(Waterfall_GetRow(&rowFrames), rowFrames, &tunedHz) && (tuneMode == TUNE_AUTO))
+	        {
+	            frequency = tunedHz;
+	            SetLo(frequency);
+
+	            if(headerLabel == LABEL_LO)
+	            {
+	                ShowLoLabel(tuneMode, frequency);
+	            }
+	        }
+
 	        Waterfall_FlushRow();
 	        last_flush_tick = now;
 	    }
@@ -1364,15 +1429,23 @@ static void MX_GPIO_Init(void)
 
 /* USER CODE BEGIN 4 */
 
-// LO readout at the top left. Fixed 13-char width: ends at x=213, clear of
-// the battery readout. The playback and recording labels, and messages,
-// use the same spot.
-static void ShowLoLabel(uint32_t frequency)
+// LO readout at the top left: "LO: 45.0 kHz" in manual, "AUTO 43.5kHz" in
+// auto. Fixed 13-char width: ends at x=213, clear of the battery readout.
+// The playback and recording labels, and messages, use the same spot.
+static void ShowLoLabel(uint8_t mode, uint32_t frequency)
 {
     char text[32];
 
-    snprintf(text, sizeof(text), "LO: %3lu.%lu kHz", frequency / 1000, (frequency % 1000) / 100);
+    snprintf(text, sizeof(text), (mode == TUNE_AUTO) ? "AUTO %3lu.%lukHz" : "LO: %3lu.%lu kHz",
+            frequency / 1000, (frequency % 1000) / 100);
     ILI9341_WriteString(5, 5, text, Font_16x26, ILI9341_WHITE, ILI9341_BLACK);
+}
+
+// Move the heterodyne LO (and V1's TIM3 LO, which has no pin on V2)
+static void SetLo(uint32_t frequency)
+{
+    DSP_SetMixerFrequency((float)frequency);
+    LO_SetFrequency(frequency);
 }
 
 /* USER CODE END 4 */

@@ -23,7 +23,7 @@ void BatDetect_Init(void);
  */
 void BatDetect_ProcessBlock(float energy);
 
-/* 1 from the trigger (2 pulses close together) until the hold time expires */
+/* 1 from the trigger (3 pulses close together) until the hold time expires */
 uint8_t BatDetect_IsBatPresent(void);
 
 /* Number of bat-like pulses so far; changes each time one ends */

@@ -10,7 +10,8 @@
  *    noise is gradually absorbed.
  * 3. Pulses: a run of blocks more than BAT_THRESHOLD_DB above the floor.
  *    1-100 ms is bat-like; over 150 ms is continuous noise.
- * 4. Trigger: 2 bat-like pulses within 600 ms; hold for 2 s after the last.
+ * 4. Trigger: 3 bat-like pulses, each within 600 ms of the one before;
+ *    hold for 2 s after the last.
  *
  * Timings come from Docs/European Bat Calls -- Species, Frequencies &
  * Acoustic ID.md. Everything counts blocks, so nothing here needs
@@ -28,8 +29,18 @@
 /* Milliseconds to whole blocks, rounded up */
 #define MS_TO_BLOCKS(ms)        ((((ms) * 1000UL) + AUDIO_BLOCK_US - 1UL) / AUDIO_BLOCK_US)
 
-/* A block is loud when its energy is this far above the noise floor */
-#define BAT_THRESHOLD_DB        10.0f
+/* A block is loud when its energy is this far above the noise floor.
+ * Replaying the Oct 30 quiet-room capture (diary 33, 44): at 10 dB the
+ * room's own noise gave 57 false pulses and 6 false passes a minute, and
+ * LED0 was lit 59% of the time; at 12 dB, 11 false pulses and no passes. */
+#define BAT_THRESHOLD_DB        12.0f
+
+/* Pulses in a row, each within BAT_TRIGGER_WINDOW_MS of the one before,
+ * that make a pass. Each extra pulse multiplies the chance of random
+ * pulses chaining into a pass by the chance of another within 600 ms:
+ * ~0.1 at 11 a minute, so 3 instead of 2 makes false passes ~10x rarer.
+ * A real pass costs one more call interval (0.1-0.2 s at 5-10 calls/s). */
+#define BAT_TRIGGER_PULSES      3U
 
 /* Shortest calls ~0.8 ms (long-eared bats) fit in one block. The longest
  * are greater noctules (~30 ms) and horseshoe CF tones (tens of ms). */
@@ -82,7 +93,7 @@ static float    floorEnergy = 0.0f;
 static uint32_t warmupBlocks = 0;         /* blocks left in the warm-up */
 static uint32_t runBlocks = 0;            /* length of the current loud run */
 static uint32_t blocksSincePulse = 0;     /* since the last bat-like pulse ended */
-static uint8_t  havePulse = 0;            /* a previous pulse exists to pair with */
+static uint8_t  chainPulses = 0;          /* pulses in a row, each within the window (max BAT_TRIGGER_PULSES) */
 static uint32_t holdBlocks = 0;           /* "present" time remaining */
 
 
@@ -96,7 +107,7 @@ static float BatDetect_ToDb(float energy)
 
 /*
  * A loud run has just ended. If it was bat-like, count it and check
- * whether it pairs with the previous one to trigger (or extend) a pass.
+ * whether it completes a chain of pulses that triggers (or extends) a pass.
  */
 static void BatDetect_EndOfRun(uint32_t lengthBlocks)
 {
@@ -107,18 +118,29 @@ static void BatDetect_EndOfRun(uint32_t lengthBlocks)
 
     batPulses++;
 
+    if((chainPulses > 0U) && (blocksSincePulse <= BAT_TRIGGER_WINDOW_BLOCKS))
+    {
+        if(chainPulses < BAT_TRIGGER_PULSES)
+        {
+            chainPulses++;
+        }
+    }
+    else
+    {
+        chainPulses = 1U;       /* the first, or too long since the last */
+    }
+
     if(batPresent)
     {
         holdBlocks = BAT_HOLD_BLOCKS;
     }
-    else if(havePulse && (blocksSincePulse <= BAT_TRIGGER_WINDOW_BLOCKS))
+    else if(chainPulses >= BAT_TRIGGER_PULSES)
     {
         batPresent = 1;
         holdBlocks = BAT_HOLD_BLOCKS;
         batTriggers++;
     }
 
-    havePulse = 1;
     blocksSincePulse = 0;
 }
 
@@ -131,7 +153,7 @@ void BatDetect_Init(void)
     warmupBlocks = BAT_WARMUP_BLOCKS;
     runBlocks = 0;
     blocksSincePulse = 0;
-    havePulse = 0;
+    chainPulses = 0;
     holdBlocks = 0;
     batPresent = 0;
 }
