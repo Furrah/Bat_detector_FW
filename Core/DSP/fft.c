@@ -24,6 +24,7 @@
 #include <string.h>
 
 #include "main.h"
+#include "diag_cycles.h"
 #include "Tables/dsp_tables.h"
 
 /*
@@ -266,7 +267,7 @@ void FFT_Process(void)
         return;
     }
 
-    start = DWT->CYCCNT;
+    start = Diag_Cycles();
 
     CFFT_Radix2(cfftRe, cfftIm);   // cfftRe/cfftIm now hold Z[k], k = 0..511
 
@@ -317,14 +318,9 @@ void FFT_Process(void)
 
     fftMagnitudeReady = 1;
 
-    cycles = DWT->CYCCNT - start;
-    // average over ~16 frames; signed, since a frame can be faster than the average
-    fftProcessCyclesAvg = (uint32_t)((int32_t)fftProcessCyclesAvg
-            + ((int32_t)cycles - (int32_t)fftProcessCyclesAvg) / 16);
-    if(cycles > fftProcessCyclesMax)
-    {
-        fftProcessCyclesMax = cycles;
-    }
+    cycles = Diag_CyclesSince(start);
+    Diag_Average16(&fftProcessCyclesAvg, cycles);
+    Diag_KeepMax(&fftProcessCyclesMax, cycles);
 
     fftFillIndex  = 0;
     fftBufferFull = 0;   // safe to resume filling now

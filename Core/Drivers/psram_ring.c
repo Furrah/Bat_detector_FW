@@ -32,6 +32,7 @@
 #include <string.h>
 
 #include "main.h"
+#include "diag_cycles.h"
 
 
 /*
@@ -159,14 +160,9 @@ static uint32_t spiCr2;
 
 
 
-static __RAM_FUNC uint32_t PsramRing_CyclesToNs(uint32_t cycles)
-{
-    return (cycles * 1000U) / (SystemCoreClock / 1000000U);
-}
-
-
-/* Called from the interrupt once CE# is high, so none of this counts against tCEM */
-static __RAM_FUNC void PsramRing_RecordTiming(uint32_t selectCycles, uint32_t entryCycles)
+/* Called from the interrupt once CE# is high, so none of this counts against
+ * tCEM. Forced inline, like the helpers below. */
+__STATIC_FORCEINLINE void PsramRing_RecordTiming(uint32_t selectCycles, uint32_t entryCycles)
 {
     if(psramRingResetStats != 0U)
     {
@@ -193,30 +189,36 @@ static __RAM_FUNC void PsramRing_RecordTiming(uint32_t selectCycles, uint32_t en
     if(selectCycles > maxSelectCycles)
     {
         maxSelectCycles = selectCycles;
-        psramRingMaxSelectNs = PsramRing_CyclesToNs(selectCycles);
+        psramRingMaxSelectNs = Diag_CyclesToNs(selectCycles);
     }
 
     if(selectCycles < minSelectCycles)
     {
         minSelectCycles = selectCycles;
-        psramRingMinSelectNs = PsramRing_CyclesToNs(selectCycles);
+        psramRingMinSelectNs = Diag_CyclesToNs(selectCycles);
     }
 
     if(entryCycles > maxEntryCycles)
     {
         maxEntryCycles = entryCycles;
-        psramRingMaxEntryNs = PsramRing_CyclesToNs(entryCycles);
+        psramRingMaxEntryNs = Diag_CyclesToNs(entryCycles);
     }
 }
 
 
-static __RAM_FUNC uint32_t PsramRing_BlockAddress(uint32_t block)
+/*
+ * The small helpers of the burst interrupt are forced inline. Left to the
+ * compiler, an unrelated change of size elsewhere in this file once turned
+ * these two into calls from PsramRing_StartBurst: about 45 cycles more
+ * per burst, from RAM (clean-up, Nov 3).
+ */
+__STATIC_FORCEINLINE uint32_t PsramRing_BlockAddress(uint32_t block)
 {
     return (block % PSRAM_RING_BLOCKS) * PSRAM_RING_BLOCK_BYTES;
 }
 
 
-static __RAM_FUNC void PsramRing_PutHeader(uint8_t *header, uint8_t command, uint32_t address)
+__STATIC_FORCEINLINE void PsramRing_PutHeader(uint8_t *header, uint8_t command, uint32_t address)
 {
     header[0] = command;
     header[1] = (uint8_t)(address >> 16);
@@ -286,7 +288,7 @@ static __RAM_FUNC void PsramRing_StartBurst(void)
     txChannel->CNDTR = length;
 
     SPI1_PSRAM_CS_GPIO_Port->BRR = SPI1_PSRAM_CS_Pin;
-    burstStart = DWT->CYCCNT;
+    burstStart = Diag_Cycles();
 
     txChannel->CCR |= DMA_CCR_EN;       /* the burst starts here */
 }
@@ -533,7 +535,7 @@ PsramRing_ReadResult_t PsramRing_ReadBlock(uint32_t block, void *dest, volatile 
 
 __RAM_FUNC void PsramRing_IRQHandler(void)
 {
-    const uint32_t entry = DWT->CYCCNT;
+    const uint32_t entry = Diag_Cycles();
     const uint32_t flags = rxDma->ISR >> rxFlagShift;
     uint32_t cycles;
     uint32_t isrCycles;
@@ -545,7 +547,7 @@ __RAM_FUNC void PsramRing_IRQHandler(void)
 
     /* end the CE# cycle before anything else */
     SPI1_PSRAM_CS_GPIO_Port->BSRR = SPI1_PSRAM_CS_Pin;
-    cycles = DWT->CYCCNT - burstStart;
+    cycles = Diag_CyclesSince(burstStart);
 
     PsramRing_StopDma();
     PsramRing_RecordTiming(cycles, entry - burstStart);
@@ -588,11 +590,11 @@ __RAM_FUNC void PsramRing_IRQHandler(void)
 
     PsramRing_StartBurst();
 
-    isrCycles = DWT->CYCCNT - entry;
+    isrCycles = Diag_CyclesSince(entry);
 
     if(isrCycles > maxIsrCycles)
     {
         maxIsrCycles = isrCycles;
-        psramRingMaxIsrNs = PsramRing_CyclesToNs(isrCycles);
+        psramRingMaxIsrNs = Diag_CyclesToNs(isrCycles);
     }
 }

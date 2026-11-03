@@ -40,6 +40,7 @@
 #include "main.h"
 #include "app_fatfs.h"
 #include "debug_link.h"
+#include "diag_cycles.h"
 #include "pipeline_config.h"
 #include "../Drivers/psram_ring.h"
 
@@ -120,7 +121,6 @@ static uint32_t stopBlock;                      /* first block not to record */
 
 static uint32_t startTick;
 static uint32_t lastSyncTick;
-static uint32_t cyclesPerUs;
 
 
 
@@ -319,10 +319,9 @@ static Recorder_Status_t Recorder_OpenFile(void)
  */
 static uint8_t Recorder_Sync(uint8_t *sector)
 {
-    const uint32_t start = DWT->CYCCNT;
+    const uint32_t start = Diag_Cycles();
     FATFS *fs = file.obj.fs;
     uint8_t ok = (f_sync(&file) == FR_OK);
-    uint32_t us;
 
     if(ok)
     {
@@ -333,12 +332,7 @@ static uint8_t Recorder_Sync(uint8_t *sector)
         ok = (disk_write(fs->drv, sector, first, 1U) == RES_OK);
     }
 
-    us = (DWT->CYCCNT - start) / cyclesPerUs;
-
-    if(us > recMaxSyncUs)
-    {
-        recMaxSyncUs = us;
-    }
+    Diag_KeepMax(&recMaxSyncUs, Diag_CyclesToUs(Diag_CyclesSince(start)));
 
     lastSyncTick = HAL_GetTick();
 
@@ -371,7 +365,6 @@ static uint8_t Recorder_WriteChunk(uint32_t first, uint32_t count)
     const UINT bytes = count * PSRAM_RING_BLOCK_BYTES;
     UINT done = 0U;
     uint32_t start;
-    uint32_t us;
     FRESULT fresult;
 
     /* (code - 2048) x 16. Unsigned arithmetic wraps to the same bits as the
@@ -391,14 +384,9 @@ static uint8_t Recorder_WriteChunk(uint32_t first, uint32_t count)
         }
     }
 
-    start = DWT->CYCCNT;
+    start = Diag_Cycles();
     fresult = f_write(&file, data, bytes, &done);
-    us = (DWT->CYCCNT - start) / cyclesPerUs;
-
-    if(us > recMaxWriteUs)
-    {
-        recMaxWriteUs = us;
-    }
+    Diag_KeepMax(&recMaxWriteUs, Diag_CyclesToUs(Diag_CyclesSince(start)));
 
     if(fresult != FR_OK)
     {
@@ -472,7 +460,6 @@ Recorder_Status_t Recorder_Start(void)
      * the pre-trigger is measured from the press */
     startTick = HAL_GetTick();
     first = Recorder_FirstBlock(PsramRing_GetWrittenBlocks());
-    cyclesPerUs = SystemCoreClock / 1000000U;
 
     slots = DebugLink_LendBuffer();
 

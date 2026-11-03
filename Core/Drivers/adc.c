@@ -9,6 +9,7 @@
 #include "adc.h"
 
 #include "main.h"
+#include "diag_cycles.h"
 #include "psram_ring.h"
 
 
@@ -48,12 +49,11 @@ static uint32_t blockCycles = 1;
  */
 static void ADC_RunBlockCallback(ADC_Callback_t callback, uint16_t *block)
 {
-    uint32_t start = DWT->CYCCNT;
-    uint32_t cycles;
+    const uint32_t start = Diag_Cycles();
 
     callback(block, AUDIO_BLOCK_SIZE);
 
-    cycles = DWT->CYCCNT - start;
+    const uint32_t cycles = Diag_CyclesSince(start);
 
     if(cycles > dspCyclesMax)
     {
@@ -66,9 +66,8 @@ static void ADC_RunBlockCallback(ADC_Callback_t callback, uint16_t *block)
 
 void ADC_Init(void)
 {
-    /* DWT cycle counter for the DSP load measurement */
-    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
-    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+    /* the cycle counter, for the DSP load measurement */
+    Diag_CyclesInit();
 
     /* CPU cycles in one block period: 680 x 256 = 174 080 at 250 kHz */
     blockCycles = (SystemCoreClock / AUDIO_SAMPLE_RATE_HZ) * AUDIO_BLOCK_SIZE;

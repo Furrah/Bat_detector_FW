@@ -14,6 +14,7 @@
 #include "psram.h"
 
 #include "main.h"
+#include "diag_cycles.h"
 
 
 #define PSRAM_SPI_PORT          hspi1
@@ -58,7 +59,7 @@ __STATIC_FORCEINLINE uint32_t PSRAM_SpiByte(SPI_TypeDef *spi, uint8_t out, uint8
 {
     while((spi->SR & SPI_SR_TXE) == 0U)
     {
-        if((DWT->CYCCNT - start) > PSRAM_BURST_TIMEOUT_CYCLES)
+        if(Diag_CyclesSince(start) > PSRAM_BURST_TIMEOUT_CYCLES)
         {
             return 0U;
         }
@@ -68,7 +69,7 @@ __STATIC_FORCEINLINE uint32_t PSRAM_SpiByte(SPI_TypeDef *spi, uint8_t out, uint8
 
     while((spi->SR & SPI_SR_RXNE) == 0U)
     {
-        if((DWT->CYCCNT - start) > PSRAM_BURST_TIMEOUT_CYCLES)
+        if(Diag_CyclesSince(start) > PSRAM_BURST_TIMEOUT_CYCLES)
         {
             return 0U;
         }
@@ -103,7 +104,7 @@ static PSRAM_Status_t PSRAM_Burst(
     __disable_irq();
 
     SPI1_PSRAM_CS_GPIO_Port->BRR = SPI1_PSRAM_CS_Pin;
-    start = DWT->CYCCNT;
+    start = Diag_Cycles();
 
     for(uint32_t i = 0; (i < headerLength) && ok; i++)
     {
@@ -128,13 +129,13 @@ static PSRAM_Status_t PSRAM_Burst(
 
     while(ok && ((spi->SR & SPI_SR_BSY) != 0U))
     {
-        if((DWT->CYCCNT - start) > PSRAM_BURST_TIMEOUT_CYCLES)
+        if(Diag_CyclesSince(start) > PSRAM_BURST_TIMEOUT_CYCLES)
         {
             ok = 0U;
         }
     }
 
-    cycles = DWT->CYCCNT - start;
+    cycles = Diag_CyclesSince(start);
     SPI1_PSRAM_CS_GPIO_Port->BSRR = SPI1_PSRAM_CS_Pin;
 
     __set_PRIMASK(primask);
@@ -210,9 +211,8 @@ PSRAM_Status_t PSRAM_Init(void)
     uint8_t header[4] = { PSRAM_CMD_READ_ID, 0x00U, 0x00U, 0x00U };    /* address is don't-care */
     uint8_t id[2] = { 0x00U, 0x00U };
 
-    /* DWT cycle counter, used to measure CE# low time */
-    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
-    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+    /* the cycle counter, for the burst deadline and CE# low time */
+    Diag_CyclesInit();
 
     HAL_GPIO_WritePin(SPI1_PSRAM_CS_GPIO_Port, SPI1_PSRAM_CS_Pin, GPIO_PIN_SET);
 
@@ -444,7 +444,7 @@ PSRAM_Status_t PSRAM_TestFull(uint32_t *failAddress)
 
 uint32_t PSRAM_GetMaxSelectNs(void)
 {
-    return (maxSelectCycles * 1000U) / (SystemCoreClock / 1000000U);
+    return Diag_CyclesToNs(maxSelectCycles);
 }
 
 

@@ -24,6 +24,8 @@
 #include <string.h>
 
 #include "main.h"
+#include "diag_cycles.h"
+#include "diag_error.h"
 
 
 #define SD_SPI_PORT             hspi2
@@ -92,13 +94,7 @@ static void SD_RecordError(SD_Step_t step, SD_Status_t status, uint8_t reply)
     if(!opFailed)
     {
         opFailed = 1U;
-        sdErrorCount++;
-
-        if(sdLastError == 0U)
-        {
-            sdLastError = (uint32_t)step | ((uint32_t)status << 8) | ((uint32_t)reply << 16)
-                    | ((uint32_t)opCommand << 24);
-        }
+        Diag_RecordFailure(&sdErrorCount, &sdLastError, DIAG_PACK4(step, status, reply, opCommand));
     }
 }
 
@@ -123,12 +119,8 @@ static void SD_CheckRxFifo(void)
 
     if((sr & (SPI_SR_FRLVL | SPI_SR_OVR)) != 0U)
     {
-        sdStaleRx++;
-
-        if(sdStaleRxFirst == 0U)
-        {
-            sdStaleRxFirst = (sr & 0xFFFFU) | ((uint32_t)opPhase << 16) | ((uint32_t)opCommand << 24);
-        }
+        Diag_RecordFailure(&sdStaleRx, &sdStaleRxFirst,
+                (sr & 0xFFFFU) | ((uint32_t)opPhase << 16) | ((uint32_t)opCommand << 24));
 
         /* 8-bit reads pop one byte each (a wider read would pop two) */
         for(uint32_t i = 0; (i < 8U) && ((spi->SR & SPI_SR_FRLVL) != 0U); i++)
@@ -161,14 +153,10 @@ static uint8_t SD_Exchange(uint8_t out)
 
     if(hal != HAL_OK)
     {
-        sdHalFailures++;
-
-        if(sdHalFailure == 0U)
-        {
-            sdHalFailure = (uint32_t)hal | ((uint32_t)SD_SPI_PORT.State << 4)
-                    | ((SD_SPI_PORT.ErrorCode & 0xFFU) << 8) | ((uint32_t)SD_SPI_PORT.Lock << 16)
-                    | ((uint32_t)opPhase << 17) | ((uint32_t)opCommand << 24);
-        }
+        Diag_RecordFailure(&sdHalFailures, &sdHalFailure,
+                (uint32_t)hal | ((uint32_t)SD_SPI_PORT.State << 4)
+                | ((SD_SPI_PORT.ErrorCode & 0xFFU) << 8) | ((uint32_t)SD_SPI_PORT.Lock << 16)
+                | ((uint32_t)opPhase << 17) | ((uint32_t)opCommand << 24));
 
         return 0xFFU;
     }
@@ -206,9 +194,8 @@ static void SD_Deselect(void)
 static SD_Status_t SD_WaitReady(uint32_t timeoutMs)
 {
     const uint32_t start = HAL_GetTick();
-    const uint32_t startCycles = DWT->CYCCNT;
+    const uint32_t startCycles = Diag_Cycles();
     SD_Status_t status = SD_ERR_TIMEOUT;
-    uint32_t us;
 
     do
     {
@@ -220,12 +207,7 @@ static SD_Status_t SD_WaitReady(uint32_t timeoutMs)
     } while((HAL_GetTick() - start) < timeoutMs);
 
     /* the cycle counter wraps every 25 s, far beyond any timeout here */
-    us = (DWT->CYCCNT - startCycles) / (SystemCoreClock / 1000000U);
-
-    if(us > sdBusyMaxUs)
-    {
-        sdBusyMaxUs = us;
-    }
+    Diag_KeepMax(&sdBusyMaxUs, Diag_CyclesToUs(Diag_CyclesSince(startCycles)));
 
     return status;
 }
