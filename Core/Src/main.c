@@ -33,13 +33,11 @@
 #include "autotune.h"
 #include "playback.h"
 #include "debug_link.h"
-#include "sd_bench.h"
 #include "recorder.h"
 #include "dac.h"
 #include "psram.h"
 #include "psram_ring.h"
 #include "sd_spi.h"
-#include "tim3_lo.h"
 #include "fft.h"
 #include "ili9341.h"
 #include "fonts.h"
@@ -146,21 +144,6 @@ static void SetLo(uint32_t frequency);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-//volatile uint32_t dspOutputCount = 0;
-//
-//void DSP_OutputCallback(
-//        const uint16_t *output,
-//        uint32_t length)
-//{
-//    dspOutputCount++;
-//
-//    DAC_WriteBlock(output, length);
-//}
-
-
-
-
-
 
 /*
  * PSRAM bring-up check, run once at boot before the audio pipeline starts,
@@ -513,8 +496,6 @@ int main(void)
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
 
-  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
-
   uint32_t frequency = 0;
 
   static uint16_t lastADC = 0;
@@ -770,11 +751,8 @@ int main(void)
 	    // USB debug capture: act on PC commands, send any data that's ready
 	    DebugLink_Poll();
 
-	    // SD write test (capture.py sdtest), when running. Ahead of the FFT
-	    // so the writer gets priority, as a recorder would need.
-	    SdBench_Poll();
-
-	    // WAV recording to SD, when running: ahead of the FFT for the same reason
+	    // WAV recording to SD, when running. Ahead of the FFT so the writer
+	    // gets priority: the PSRAM ring holds only 16.8 s.
 	    Recorder_Poll();
 
 	    FFT_Process();
@@ -1441,11 +1419,10 @@ static void ShowLoLabel(uint8_t mode, uint32_t frequency)
     ILI9341_WriteString(5, 5, text, Font_16x26, ILI9341_WHITE, ILI9341_BLACK);
 }
 
-// Move the heterodyne LO (and V1's TIM3 LO, which has no pin on V2)
+// Move the heterodyne LO (the digital mixer in dsp.c)
 static void SetLo(uint32_t frequency)
 {
     DSP_SetMixerFrequency((float)frequency);
-    LO_SetFrequency(frequency);
 }
 
 /* USER CODE END 4 */

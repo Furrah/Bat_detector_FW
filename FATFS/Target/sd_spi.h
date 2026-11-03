@@ -71,8 +71,6 @@ SD_Status_t SD_GetInitStatus(void);
  *                     (low 16 bits) and its first byte (bits 16-23); 0xFFFF
  *                     if it never answered in 1024 bytes; 0 if not probed
  *   sdBusyMaxUs       longest wait for the card to stop being busy
- *   sdUseDma          1: 512-byte blocks by DMA, 0: polled (the default; DMA
- *                     writes occasionally lose a block's start token, diary 40)
  */
 typedef enum
 {
@@ -80,9 +78,9 @@ typedef enum
     SD_STEP_SELECT,             /* still busy when selected for a command */
     SD_STEP_COMMAND,            /* no or bad R1 */
     SD_STEP_READ_TOKEN,         /* no or bad data token */
-    SD_STEP_READ_DATA,          /* SPI/DMA failure receiving a block */
+    SD_STEP_READ_DATA,          /* SPI failure receiving a block */
     SD_STEP_WRITE_BUSY,         /* still busy before the next block or the stop token */
-    SD_STEP_WRITE_DATA,         /* SPI/DMA failure sending a block */
+    SD_STEP_WRITE_DATA,         /* SPI failure sending a block */
     SD_STEP_WRITE_REJECTED      /* data response wasn't "accepted" */
 } SD_Step_t;
 
@@ -124,7 +122,6 @@ extern volatile uint32_t sdLastError;
 extern volatile uint32_t sdLastCardStatus;
 extern volatile uint32_t sdLateResponse;
 extern volatile uint32_t sdBusyMaxUs;
-extern volatile uint8_t  sdUseDma;
 extern volatile uint32_t sdRecoveries;
 extern volatile uint32_t sdRecoveryFailures;
 

@@ -20,8 +20,6 @@
  *   'M'  payload: the last snapshot's blocks as read back from the PSRAM
  *        ring, arg0 = ring block number of the first, arg1 = sample rate.
  *        Empty, with arg0 = 0xFFFFFFFF, if they can't be read.
- *   'W'  payload: SdBench_Result_t (sd_bench.h), sent when the SD write
- *        test ends
  *   'N'  payload: the stats table, arg0 entries of arg1 (32) bytes: name
  *        (27 chars, NUL-padded), type ('u' uint32, 'b' uint8, 'f' float),
  *        then 4 bytes the PC ignores
@@ -30,9 +28,9 @@
  *   'F'  payload: one FFT frame's arg0 raw ADC codes (uint16), then
  *        FFT_Process's arg1 magnitudes for it (float), bins 0-1 included
  *
- * One 8 KB buffer holds the snapshot, the energy FIFO or the SD write
- * test's blocks, so starting one stops the energy stream. It's lent to the
- * WAV recorder while that records (DebugLink_LendBuffer).
+ * One 8 KB buffer holds the snapshot, the energy FIFO or an FFT frame, so
+ * starting one stops the energy stream. It's lent to the WAV recorder
+ * while that records (DebugLink_LendBuffer).
  *
  * The audio interrupt fills the buffer and the main loop sends it with
  * CDC_Transmit_FS, which reports busy until the previous transfer has
@@ -53,7 +51,6 @@
 #include "main.h"
 #include "pipeline_config.h"
 #include "recorder.h"
-#include "sd_bench.h"
 #include "sd_spi.h"
 #include "usbd_cdc_if.h"
 #include "../DSP/autotune.h"
@@ -81,13 +78,6 @@
 
 /* 12-bit ADC mid-scale, as in DSP_ProcessBlock */
 #define ADC_MIDSCALE                2048
-
-/* 'W' is followed by three bytes: the SD test's pre-trigger in seconds, its
- * sectors per write, and 1/0 for DMA or polled. A larger byte isn't a
- * parameter. */
-#define DEBUG_SD_BENCH_MAX_PRETRIGGER_S     15U
-#define DEBUG_SD_BENCH_PARAMS               3U
-#define DEBUG_SD_BENCH_PARAM_MAX            16U
 
 
 typedef struct
@@ -159,7 +149,6 @@ typedef enum
     DEBUG_MODE_SNAPSHOT_READY,  /* full; the main loop sends it */
     DEBUG_MODE_ENERGY,          /* the interrupt adds an energy record per block */
     DEBUG_MODE_READBACK,        /* the PSRAM ring is reading the snapshot back */
-    DEBUG_MODE_SD_BENCH,        /* the SD write test has the buffer */
     DEBUG_MODE_FFT_CAPTURE,     /* the FFT is capturing a frame and its result */
     DEBUG_MODE_LENT             /* lent to the WAV recorder */
 } DebugMode_t;
@@ -204,9 +193,6 @@ static uint16_t txSequence = 0;
 static uint32_t txRecords = 0;                  /* energy records in the frame being sent */
 static uint32_t readbackNext = 0;               /* next snapshot block to ask the ring for */
 static volatile uint8_t readbackDone[DEBUG_SNAPSHOT_BLOCKS];
-static uint8_t pendingCommand = 0;              /* a command collecting its parameter bytes */
-static uint8_t pendingCount = 0;
-static uint8_t pendingParams[DEBUG_SD_BENCH_PARAMS];
 
 
 /*
@@ -263,7 +249,6 @@ static const DebugStat_t debugStats[] =
     { "sdHalFailure",           'u', &sdHalFailure },
     { "sdStaleRx",              'u', &sdStaleRx },
     { "sdStaleRxFirst",         'u', &sdStaleRxFirst },
-    { "sdUseDma",               'b', &sdUseDma },
     { "sdRecoveries",           'u', &sdRecoveries },
     { "sdRecoveryFailures",     'u', &sdRecoveryFailures },
 
@@ -469,11 +454,6 @@ static void DebugLink_FrameSent(void)
 
         energyRead = read;
     }
-    else if(txHeader.type == 'W')
-    {
-        SdBench_ReleaseResult();        /* the SD test hands the buffer back */
-        mode = DEBUG_MODE_IDLE;
-    }
     else if((txHeader.type == 'F') && (mode == DEBUG_MODE_FFT_CAPTURE))
     {
         mode = DEBUG_MODE_IDLE;
@@ -640,49 +620,9 @@ static void DebugLink_ResetTimings(void)
 }
 
 
-static void DebugLink_StartSdBench(uint8_t pretriggerSeconds, uint8_t sectorsPerWrite, uint8_t useDma)
-{
-    /* takes the buffer, so it stops an energy stream; not while a snapshot or read-back has it */
-    if((mode != DEBUG_MODE_IDLE) && (mode != DEBUG_MODE_ENERGY))
-    {
-        return;
-    }
-
-    if(pretriggerSeconds > DEBUG_SD_BENCH_MAX_PRETRIGGER_S)
-    {
-        pretriggerSeconds = DEBUG_SD_BENCH_MAX_PRETRIGGER_S;
-    }
-
-    mode = DEBUG_MODE_SD_BENCH;
-
-    /* an invalid sectors-per-write comes back as an error result */
-    SdBench_Start(&captureBuffer, sizeof(captureBuffer),
-            ((uint32_t)pretriggerSeconds * AUDIO_SAMPLE_RATE_HZ) / AUDIO_BLOCK_SIZE, sectorsPerWrite,
-            useDma != 0U);
-}
-
-
 static void DebugLink_HandleCommand(uint8_t command)
 {
     uint32_t primask;
-
-    if(pendingCommand == 'W')
-    {
-        if(command <= DEBUG_SD_BENCH_PARAM_MAX)
-        {
-            pendingParams[pendingCount++] = command;
-
-            if(pendingCount == DEBUG_SD_BENCH_PARAMS)
-            {
-                pendingCommand = 0U;
-                DebugLink_StartSdBench(pendingParams[0], pendingParams[1], pendingParams[2]);
-            }
-            return;
-        }
-
-        /* not a parameter (e.g. an 'S' after a lone 'W'): a command of its own */
-        pendingCommand = 0U;
-    }
 
     switch(command)
     {
@@ -708,7 +648,7 @@ static void DebugLink_HandleCommand(uint8_t command)
         break;
 
     case 'E':
-        if((mode == DEBUG_MODE_SD_BENCH) || (mode == DEBUG_MODE_FFT_CAPTURE) || (mode == DEBUG_MODE_LENT))
+        if((mode == DEBUG_MODE_FFT_CAPTURE) || (mode == DEBUG_MODE_LENT))
         {
             break;      /* the buffer is taken */
         }
@@ -725,11 +665,7 @@ static void DebugLink_HandleCommand(uint8_t command)
         break;
 
     case 'S':
-        if(mode == DEBUG_MODE_SD_BENCH)
-        {
-            SdBench_Stop();     /* keeps the buffer until its result has been sent */
-        }
-        else if(mode != DEBUG_MODE_LENT)    /* the recorder keeps a lent buffer */
+        if(mode != DEBUG_MODE_LENT)    /* the recorder keeps a lent buffer */
         {
             FFT_CancelCapture();
             mode = DEBUG_MODE_IDLE;
@@ -743,11 +679,6 @@ static void DebugLink_HandleCommand(uint8_t command)
             mode = DEBUG_MODE_FFT_CAPTURE;
             FFT_RequestCapture(captureBuffer.fft.raw, captureBuffer.fft.magnitude);
         }
-        break;
-
-    case 'W':
-        pendingCommand = 'W';   /* the next two bytes are its parameters */
-        pendingCount = 0U;
         break;
 
     case 'N':
@@ -784,18 +715,7 @@ static void DebugLink_HandleCommand(uint8_t command)
 
 static void DebugLink_Reset(void)
 {
-    if(mode == DEBUG_MODE_SD_BENCH)
-    {
-        /* the SD test keeps the buffer until it has closed its file */
-        SdBench_Stop();
-
-        if(SdBench_GetResult() != NULL)
-        {
-            SdBench_ReleaseResult();
-            mode = DEBUG_MODE_IDLE;
-        }
-    }
-    else if(mode != DEBUG_MODE_LENT)    /* runs on every pass with USB unplugged: the recorder keeps the buffer */
+    if(mode != DEBUG_MODE_LENT)    /* runs on every pass with USB unplugged: the recorder keeps the buffer */
     {
         FFT_CancelCapture();
         mode = DEBUG_MODE_IDLE;
@@ -803,7 +723,6 @@ static void DebugLink_Reset(void)
 
     txStage = TX_IDLE;
     commandTail = commandHead;
-    pendingCommand = 0U;
 }
 
 
@@ -840,10 +759,6 @@ void DebugLink_Poll(void)
             else if(mode == DEBUG_MODE_READBACK)
             {
                 DebugLink_ContinueReadback();
-            }
-            else if((mode == DEBUG_MODE_SD_BENCH) && (SdBench_GetResult() != NULL))
-            {
-                DebugLink_StartFrame('W', SdBench_GetResult(), sizeof(SdBench_Result_t), 0U, 0U);
             }
             else if((mode == DEBUG_MODE_FFT_CAPTURE) && FFT_CaptureDone())
             {

@@ -30,17 +30,11 @@ void DAC_Init(void)
 
 void DAC_Start(void)
 {
-
-
-    HAL_StatusTypeDef status;
-
-    status = HAL_DAC_Start_DMA(
-            &hdac1,
-            DAC_CHANNEL_1,
-            (uint32_t*)dacBuffer,
-            DAC_BUFFER_SIZE,
-            DAC_ALIGN_12B_R);
-
+    if(HAL_DAC_Start_DMA(&hdac1, DAC_CHANNEL_1, (uint32_t *)dacBuffer, DAC_BUFFER_SIZE,
+            DAC_ALIGN_12B_R) != HAL_OK)
+    {
+        Error_Handler();
+    }
 }
 
 /*

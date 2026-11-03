@@ -1,6 +1,6 @@
 """
-check_raw.py - check the SD test's files (SBnnX.RAW, from capture.py sdtest)
-and the recorder's (BATnnnnn.WAV) on the PC.
+check_raw.py - check the recorder's files (BATnnnnn.WAV) on the PC, and
+files of raw ADC codes (.RAW, as the archived SD write test wrote).
 
 A .RAW file is raw little-endian uint16 ADC codes copied from the PSRAM ring
 in 512-byte blocks. A 12-bit ADC code is at most 4095, so any larger 16-bit

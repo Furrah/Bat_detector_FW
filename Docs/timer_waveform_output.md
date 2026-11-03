@@ -3,7 +3,7 @@
 V1 generated the square-wave LO for its analogue mixer with TIM3 CH1 on PB4. V2 mixes digitally, so this is being removed from the V2 firmware. It's kept here for future builds, since a timer channel is the cheapest way to get a stable, CPU-free waveform on a pin.
 
 The last full working version is commit `cd8940b` ("V1 of firmware complete"):
-- `Core/Drivers/tim3_lo.c` / `tim3_lo.h`
+- `Core/Drivers/tim3_lo.c` / `tim3_lo.h` (now in `Archive/`)
 - `MX_TIM3_Init()` in `Core/Src/main.c`
 - `HAL_TIM_MspPostInit()` in `Core/Src/stm32g4xx_hal_msp.c`
 

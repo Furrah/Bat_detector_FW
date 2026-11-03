@@ -11,7 +11,7 @@
  * Samples are the 12-bit ADC codes about mid-scale, times 16: the ADC's
  * full scale is 16-bit full scale, and the low 4 bits are always 0.
  *
- * The audio is written as it would be by the SD write test (sd_bench.h):
+ * The audio is written the way the SD write test found best (diary 39-40):
  * 8 sectors per write, polled, from the main loop ahead of the FFT. Until
  * the pre-trigger has been caught up, the file falls behind the live audio
  * by up to the pre-trigger's length; stopping writes out that backlog

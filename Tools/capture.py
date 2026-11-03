@@ -10,7 +10,6 @@ top of that file, and the structs below must match it.
     python -I Tools/capture.py verify --count 50
     python -I Tools/capture.py stats
     python -I Tools/capture.py stats --window 30
-    python -I Tools/capture.py sdtest --seconds 60 --pretrigger 5 --sectors 1 4 8 16
     python -I Tools/capture.py fftcheck --count 10
 
 raw     snapshots of 4096 unprocessed ADC samples (16.4 ms each)
@@ -21,11 +20,6 @@ verify  checks the PSRAM ring: takes a raw snapshot, reads the same blocks
 stats   the timing and health counters (the Live Expressions ones, e.g.
         dspLoadMaxPercent). With --window S it first restarts the worst-case
         timings, waits S seconds, then reads them (nothing saved)
-sdtest  copies the PSRAM ring's live audio to SBnnX.RAW on the SD card
-        (nn = sectors per write, X = P polled / D DMA) while everything else
-        runs, starting --pretrigger seconds behind; reports whether those
-        writes keep up with recording (diary 38-40). Check the files on the
-        PC afterwards with Tools/check_raw.py
 fftcheck  captures FFT frames with the board's result for each (FFT_Process)
         and compares them with numpy's rfft of the same raw samples
 
@@ -81,21 +75,10 @@ STATS_MUST_BE_ZERO = {"dacLateBlocks", "psramRingOverTcem", "psramRingLateBlocks
 STATS_LIMITS = {"psramRingMaxSelectNs": (8000, "the PSRAM's 8 us tCEM"),
                 "dspLoadMaxPercent": (100, "a whole block period")}
 
-# SdBench_Result_t (Core/Inc/sd_bench.h)
-SD_RESULT = struct.Struct("<25I8I")
-SD_RESULT_FIELDS = (
-    "status", "fresult", "flags", "elapsed_ms", "blocks_written", "blocks_lost",
-    "read_failures", "start_backlog", "max_backlog", "catch_up_ms", "catch_up_blocks",
-    "catch_up_audio_blocks", "catch_up_fft_dropped", "steady_ms", "steady_busy_us",
-    "steady_audio_blocks", "steady_fft_dropped", "max_write_us", "sectors_per_write",
-    "cluster_sectors", "catch_up_busy_us", "uses_dma", "sd_error", "sd_card_status",
-    "sd_busy_max_us",
-)
-
 # sd_spi.h: SD_Step_t, SD_Status_t, and the commands in sdLastError
 SD_STEPS = ("none", "card still busy when selected", "bad command response (R1)", "no or bad data token",
-            "SPI/DMA failure receiving a block", "card still busy before the next block",
-            "SPI/DMA failure sending a block", "block rejected by the card")
+            "SPI failure receiving a block", "card still busy before the next block",
+            "SPI failure sending a block", "block rejected by the card")
 SD_DRIVER_STATUS = ("OK", "no card", "init failed", "timeout", "command rejected", "data rejected", "SPI error")
 SD_COMMANDS = {0: "CMD0", 17: "CMD17 read", 18: "CMD18 multi read", 24: "CMD24 write",
                25: "CMD25 multi write", 0xFE: "sync"}
@@ -177,23 +160,6 @@ def describe_late_response(value):
     else:
         meaning = "not a data response"
     return f"card answered {count} byte(s) late with 0x{reply:02X}: {meaning}"
-SD_STATUS = ("done", "buffer too small", "playback has the ring", "the PSRAM ring isn't recording",
-             "f_open failed (no card, or not FAT)", "f_write failed, or the card is full",
-             "f_close failed", "sectors per write isn't 1, 2, 4, 8 or 16")
-SD_SECTOR_CHOICES = (1, 2, 4, 8, 16)    # SD_BENCH_MAX_SECTORS = 16
-SD_FLAG_RING_PAUSED = 0x01
-SD_FLAG_TIME_LIMIT = 0x02
-SD_FLAG_NEVER_CAUGHT = 0x04
-SD_HISTOGRAM_BINS = ("<1", "1-2", "2-5", "5-10", "10-50", "50-100", "100-250", ">=250")   # ms
-SD_RING_BLOCKS = 16384          # PSRAM_RING_BLOCKS
-SD_MAX_PRETRIGGER = 15          # DEBUG_SD_BENCH_MAX_PRETRIGGER_S
-
-# FatFS R0.12c FRESULT codes
-FRESULT = ("FR_OK", "FR_DISK_ERR", "FR_INT_ERR", "FR_NOT_READY", "FR_NO_FILE", "FR_NO_PATH",
-           "FR_INVALID_NAME", "FR_DENIED", "FR_EXIST", "FR_INVALID_OBJECT", "FR_WRITE_PROTECTED",
-           "FR_INVALID_DRIVE", "FR_NOT_ENABLED", "FR_NO_FILESYSTEM", "FR_MKFS_ABORTED", "FR_TIMEOUT",
-           "FR_LOCKED", "FR_NOT_ENOUGH_CORE", "FR_TOO_MANY_OPEN_FILES", "FR_INVALID_PARAMETER")
-
 MAX_PAYLOAD = 65536
 CAPTURE_DIR = Path(__file__).resolve().parent.parent / "Captures"
 
@@ -587,194 +553,6 @@ def print_stats(values, uptime_ms, info):
     print("All counters within their limits" if not problems else f"{problems} counter(s) out of limits")
 
 
-def sd_test(reader, info, seconds, pretrigger, sectors, dma):
-    """Run the board's SD write test (sd_bench.c) once; return (result, data to save)."""
-    table = read_stat_table(reader)
-
-    # Baseline: how much the FFT drops with no SD traffic
-    first, _ = read_stats(reader, table)
-    time.sleep(2.0)
-    baseline, _ = read_stats(reader, table)
-    baseline_drop = ratio(baseline["fftDroppedBlocks"] - first["fftDroppedBlocks"],
-                          baseline["blockCount"] - first["blockCount"])
-
-    reader.port.write(b"Z")         # so the worst-case timings cover the test only
-    reader.port.write(b"W" + bytes([pretrigger, sectors, dma]))
-    print(f"SD write test: {sectors} sector(s) per write, {'DMA' if dma else 'polled'}, {seconds:.0f} s, "
-          f"starting {pretrigger} s behind the ring")
-
-    frame = None
-    start = time.monotonic()
-    next_report = start + 10.0
-
-    while time.monotonic() - start < seconds:
-        received = reader.read_frame(timeout=0.5)
-        if received is not None and received.kind == "W":
-            frame = received        # ended early: an error, or the board's time limit
-            break
-        if time.monotonic() >= next_report:
-            print(f"  {time.monotonic() - start:3.0f} s")
-            next_report += 10.0
-
-    if frame is None:
-        reader.port.write(b"S")
-        frame = reader.wait_for("W", timeout=5.0)
-        if frame is None:
-            sys.exit("The board didn't send the SD test's result")
-
-    if len(frame.payload) != SD_RESULT.size:
-        sys.exit(f"SD test result is {len(frame.payload)} bytes, {SD_RESULT.size} expected: update SD_RESULT")
-
-    after, _ = read_stats(reader, table)
-
-    values = SD_RESULT.unpack(frame.payload)
-    result = dict(zip(SD_RESULT_FIELDS, values))
-    result["histogram"] = np.array(values[len(SD_RESULT_FIELDS):], dtype=np.uint32)
-
-    summary = print_sd_result(result, info, baseline_drop, after)
-
-    names = [name for name, _ in table]
-    return summary, {key: np.asarray(value) for key, value in result.items()} | {
-        "pretrigger_s": np.uint32(pretrigger),
-        "baseline_fft_drop": np.float64(baseline_drop),
-        "stat_names": np.array(names),
-        "stats_after": np.array([float(after[name]) for name in names]),
-    }
-
-
-def print_sd_result(r, info, baseline_drop, stats):
-    audio_rate = info["sample_rate"] * 2            # bytes/s that recording writes
-    block_bytes = info["block_size"] * 2
-    block_seconds = info["block_size"] / info["sample_rate"]
-    never_caught = bool(r["flags"] & SD_FLAG_NEVER_CAUGHT)
-    sectors = r["sectors_per_write"]
-    transfer = "DMA" if r["uses_dma"] else "polled"
-    summary = {"sectors": sectors, "dma": transfer, "rate": None, "headroom": None, "busy": None,
-               "slowest_ms": None, "lost": r["blocks_lost"], "fft_drop": None, "verdict": "no verdict"}
-
-    status = SD_STATUS[r["status"]] if r["status"] < len(SD_STATUS) else f"status {r['status']}"
-    if r["status"] != 0:
-        error = FRESULT[r["fresult"]] if r["fresult"] < len(FRESULT) else f"FRESULT {r['fresult']}"
-        print(f"SD test FAILED: {status}" + (f" ({error})" if r["fresult"] else ""))
-        print(f"  SD driver: {describe_sd_error(r['sd_error'])}")
-        print(f"  Card status after the failure: {describe_card_status(r['sd_card_status'])}")
-        print(f"  Late-response probe: {describe_late_response(stats.get('sdLateResponse', 0))}")
-        print(f"  SD errors since boot: {stats.get('sdErrorCount', 'n/a')}")
-        print(f"  First failed 1-byte HAL transfer: {describe_hal_failure(stats.get('sdHalFailure', 0))}")
-        print(f"  First leftover receive data: {describe_stale_rx(stats.get('sdStaleRxFirst', 0))}")
-        summary["verdict"] = f"failed: {status}"
-        if r["blocks_written"] == 0:
-            return summary
-
-    # sd_bench.c SD_BENCH_FILE_FORMAT
-    file_name = f"SB{sectors:02d}{'D' if r['uses_dma'] else 'P'}.RAW"
-    print(f"SD write test, {sectors} sector(s) per f_write, {transfer}: {status} after "
-          f"{r['elapsed_ms'] / 1000:.1f} s, {r['blocks_written']} blocks "
-          f"({r['blocks_written'] * block_bytes / 1e6:.1f} MB) written to {file_name}")
-    print(f"  Longest wait for the card to stop being busy: {r['sd_busy_max_us'] / 1000:.1f} ms "
-          f"(the driver gives up at 500 ms)")
-    print(f"  Driver self-checks: {stats.get('sdHalFailures', 'n/a')} failed 1-byte HAL transfers "
-          f"(first: {describe_hal_failure(stats.get('sdHalFailure', 0))}); "
-          f"{stats.get('sdStaleRx', 'n/a')} times leftover receive data "
-          f"(first: {describe_stale_rx(stats.get('sdStaleRxFirst', 0))})")
-    recoveries = stats.get("sdRecoveries", 0)
-    print(f"  Recoveries (card restarted and the transfer retried): {recoveries}, "
-          f"{stats.get('sdRecoveryFailures', 0)} of them failed"
-          + (f"; first failure: {describe_sd_error(stats.get('sdLastError', 0))}, "
-             f"probe: {describe_late_response(stats.get('sdLateResponse', 0))}" if recoveries else ""))
-    print(f"  Card clusters: {r['cluster_sectors']} sectors ({r['cluster_sectors'] * block_bytes // 1024} KB)"
-          + ("" if r["cluster_sectors"] % sectors == 0 else ": smaller than a write, so FatFS splits some writes"))
-    if sectors == SD_SECTOR_CHOICES[-1]:
-        print(f"  Note: at {sectors} sectors the whole buffer is one write, so the next blocks can't load "
-              "from the ring while it's being written")
-    if r["flags"] & SD_FLAG_TIME_LIMIT:
-        print("  Stopped by the board's 600 s limit")
-    if r["flags"] & SD_FLAG_RING_PAUSED:
-        print("  WARNING: the ring paused during the test (PLAYBACK pressed?), so these figures are off")
-
-    headroom_catch = None
-    if r["start_backlog"] and r["catch_up_ms"]:
-        rate = r["catch_up_blocks"] * block_bytes / (r["catch_up_ms"] / 1000)
-        headroom_catch = rate / audio_rate
-        caught = (f"not cleared in {r['catch_up_ms'] / 1000:.1f} s" if never_caught
-                  else f"cleared in {r['catch_up_ms'] / 1000:.1f} s")
-        print(f"  Catching up {r['start_backlog'] * block_seconds:.1f} s of pre-trigger: {caught}, at "
-              f"{rate / 1000:.0f} kB/s = {headroom_catch:.2f}x the {audio_rate / 1000:.0f} kB/s recording needs")
-        if r["catch_up_blocks"]:
-            print(f"    inside f_write {r['catch_up_busy_us'] / (r['catch_up_ms'] * 1000):.0%} of that time, "
-                  f"{r['catch_up_busy_us'] / r['catch_up_blocks'] / 1000:.3f} ms per sector")
-        summary["rate"] = rate
-
-    headroom_steady = None
-    if r["steady_ms"]:
-        busy = r["steady_busy_us"] / (r["steady_ms"] * 1000)
-        headroom_steady = 1 / busy if busy else float("inf")
-        steady_blocks = r["blocks_written"] - r["catch_up_blocks"]
-        per_sector = f", {r['steady_busy_us'] / steady_blocks / 1000:.3f} ms per sector" if steady_blocks else ""
-        print(f"  Once caught up ({r['steady_ms'] / 1000:.1f} s): inside f_write {busy:.0%} of the time{per_sector}, "
-              f"about {headroom_steady:.2f}x headroom")
-        summary["busy"] = busy
-
-    print(f"  Backlog: at most {r['max_backlog']} blocks ({r['max_backlog'] * block_seconds:.2f} s) of the ring's "
-          f"{SD_RING_BLOCKS * block_seconds:.1f} s; {r['blocks_lost']} blocks lost, "
-          f"{r['read_failures']} ring read failures")
-
-    print(f"  f_write: {int(r['histogram'].sum())} calls of {sectors} sector(s), "
-          f"slowest {r['max_write_us'] / 1000:.1f} ms")
-    print("    ms     " + "".join(f"{label:>9}" for label in SD_HISTOGRAM_BINS))
-    print("    calls  " + "".join(f"{int(count):>9}" for count in r["histogram"]))
-    summary["slowest_ms"] = r["max_write_us"] / 1000
-
-    catch_drop = ratio(r["catch_up_fft_dropped"], r["catch_up_audio_blocks"])
-    steady_drop = ratio(r["steady_fft_dropped"], r["steady_audio_blocks"])
-    print(f"  FFT blocks dropped (the waterfall's input): {percent(baseline_drop)} before the test, "
-          f"{percent(catch_drop)} while catching up, {percent(steady_drop)} once caught up")
-    summary["fft_drop"] = steady_drop if steady_drop == steady_drop else catch_drop
-
-    clock = stats.get("SystemCoreClock") or 170_000_000
-    print(f"  During the test: DSP worst case {stats['dspLoadMaxPercent']}% of a block, "
-          f"FFT worst case {stats['fftProcessCyclesMax'] / clock * 1e3:.2f} ms, "
-          f"PSRAM CE# worst case {stats['psramRingMaxSelectNs'] / 1000:.2f} us")
-    for name, value in stats.items():
-        note = check_stat(name, value)
-        if note:
-            print(f"  {name} = {value} {note}")
-
-    # Thresholds agreed in diary 38
-    headroom = headroom_catch if headroom_catch is not None else headroom_steady
-    writes = "single-sector writes" if sectors == 1 else f"{sectors}-sector writes"
-    if r["status"] != 0 or headroom is None:
-        verdict = summary["verdict"]
-    elif r["blocks_lost"] or headroom < 1.0:
-        verdict = f"{headroom:.2f}x: {writes} can't keep up under recording load"
-    elif never_caught:
-        verdict = (f"{headroom:.2f}x, but the pre-trigger wasn't cleared in time: "
-                   f"run longer (needs ~{r['start_backlog'] * block_seconds / max(headroom - 1, 0.01):.0f} s)")
-    elif headroom < 1.6:
-        verdict = f"{headroom:.2f}x: {writes} keep up, but the margin is thin"
-    else:
-        verdict = f"{headroom:.2f}x: {writes} are enough for recording"
-    print(f"Verdict: {verdict}")
-
-    summary["headroom"] = headroom
-    summary["verdict"] = verdict
-    return summary
-
-
-def print_sd_summary(summaries):
-    """One line per sectors-per-write setting, after a sweep."""
-    def show(value, width, spec, unit=""):
-        text = "n/a" if value is None or value != value else format(value, spec) + unit
-        return f"{text:>{width}}"
-
-    print("\nSectors  Transfer  kB/s catching up  headroom  f_write busy once caught up  slowest  lost  FFT dropped")
-    for s in summaries:
-        rate = None if s["rate"] is None else s["rate"] / 1000
-        print(f"{s['sectors']:>7}  {s['dma']:>8}  {show(rate, 16, '.0f')}  {show(s['headroom'], 8, '.2f', 'x')}  "
-              f"{show(s['busy'], 27, '.0%')}  {show(s['slowest_ms'], 7, '.1f', ' ms')}  {s['lost']:>4}  "
-              f"{show(s['fft_drop'], 11, '.0%')}")
-
-
 def save(kind, label, info, data):
     CAPTURE_DIR.mkdir(exist_ok=True)
     name = time.strftime("%Y%m%d_%H%M%S") + f"_{kind}" + (f"_{label}" if label else "") + ".npz"
@@ -794,27 +572,15 @@ def save(kind, label, info, data):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("command", choices=["info", "raw", "energy", "verify", "stats", "sdtest", "fftcheck"])
+    parser.add_argument("command", choices=["info", "raw", "energy", "verify", "stats", "fftcheck"])
     parser.add_argument("--port", help="COM port (default: find the board by its USB IDs)")
     parser.add_argument("--label", default="", help="short note for the file name, e.g. quiet-room")
     parser.add_argument("--count", type=int, default=20, help="raw, verify, fftcheck: number of snapshots (default 20)")
     parser.add_argument("--interval", type=float, default=0.25, help="raw, verify, fftcheck: seconds between snapshots")
-    parser.add_argument("--seconds", type=float, default=60.0, help="energy, sdtest: how long to run")
+    parser.add_argument("--seconds", type=float, default=60.0, help="energy: how long to run")
     parser.add_argument("--window", type=float, default=0.0,
                         help="stats: restart the worst-case timings, wait this long, then read")
-    parser.add_argument("--pretrigger", type=int, default=5,
-                        help=f"sdtest: start this many seconds behind the ring, 0-{SD_MAX_PRETRIGGER} (default 5)")
-    parser.add_argument("--sectors", type=int, nargs="+", default=[1],
-                        help="sdtest: sectors per write, 1 2 4 8 or 16; several run one after another (default 1)")
-    parser.add_argument("--dma", type=int, nargs="+", default=[0], choices=[0, 1],
-                        help="sdtest: 0 = polled data blocks (the driver's default), 1 = DMA; "
-                             "both runs each setting both ways (default 0)")
     args = parser.parse_args()
-
-    if not 0 <= args.pretrigger <= SD_MAX_PRETRIGGER:
-        sys.exit(f"--pretrigger must be 0-{SD_MAX_PRETRIGGER} s")
-    if any(n not in SD_SECTOR_CHOICES for n in args.sectors):
-        sys.exit(f"--sectors must be from {SD_SECTOR_CHOICES}")
 
     port_name = args.port or find_port()
     print(f"Board on {port_name}")
@@ -843,27 +609,6 @@ def main():
                 time.sleep(args.window)
             values, uptime_ms = read_stats(reader, table)
             print_stats(values, uptime_ms, info)
-            return
-
-        if args.command == "sdtest":
-            summaries = []
-            runs = [(sectors, dma) for dma in args.dma for sectors in args.sectors]
-            for i, (sectors, dma) in enumerate(runs):
-                if i:
-                    print()
-                summary, data = sd_test(reader, info, args.seconds, args.pretrigger, sectors, dma)
-                summaries.append(summary)
-                label = f"{args.label}-" if args.label else ""
-                name = f"{label}{sectors}sect-{'dma' if dma else 'polled'}"
-                print(f"Saved {save('sdtest', name, info, data)}")
-                # the driver retries once after re-initialising the card, so a failure
-                # that still gets through means the card is in trouble: stop
-                if int(data["status"]) in (4, 5, 6) and i + 1 < len(runs):
-                    print("Stopping the sweep: the SD card failed even after a restart")
-                    break
-            if len(summaries) > 1:
-                print_sd_summary(summaries)
-            port.write(b"S")
             return
 
         if args.command == "raw":

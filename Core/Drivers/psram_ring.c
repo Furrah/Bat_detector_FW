@@ -69,7 +69,7 @@ extern DMA_HandleTypeDef hdma_spi1_tx;
 #define PSRAM_RING_LAST_IRQn        CORDIC_IRQn
 
 /* 16 so the SD writer can queue a whole multi-sector chunk while the last
- * one is written (sd_bench.c). 12 bytes each. */
+ * one is written (recorder.c). 12 bytes each. */
 #define PSRAM_RING_READ_QUEUE       16U
 
 /* Reads keep this many blocks (65 ms) clear of the writer, so it can't lap them */

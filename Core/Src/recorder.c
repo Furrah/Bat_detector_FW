@@ -4,7 +4,7 @@
  * WAV recording to the SD card; see recorder.h.
  *
  * The audio goes PSRAM ring -> slot -> file, the scheme the SD write test
- * measured (sd_bench.c, diary 39-40): 8 sectors per f_write, polled, with
+ * measured (diary 39-40; Archive/sd_bench.c): 8 sectors per f_write, polled, with
  * the next chunk loading from the ring while one is written. Block b uses
  * slot b % RECORDER_SLOTS; blocks saveNext .. readNext-1 have their ring
  * reads queued or landed. A chunk is converted to signed 16-bit in its

@@ -12,12 +12,10 @@
  * limit on how long CS may stay low, and HAL keeps SPI2 in the state the
  * display driver (also HAL) expects.
  *
- * 512-byte data blocks go by DMA (SPI2_RX on DMA1 Ch4, SPI2_TX on Ch5),
- * programmed at register level (SD_DmaTransfer), and the driver waits for
- * them to finish. Polled, the audio and ring interrupts stretched each
- * block's transfer to about 2.5x its 0.19 ms wire time (diary 39); the DMA
- * keeps going while they run. Commands, responses and busy polling are a
- * few bytes each and stay polled, through HAL like the display's transfers.
+ * Everything is polled through HAL, the data blocks included. A
+ * register-level DMA version of the block transfers was tried and dropped:
+ * now and then the card missed a block's start token and stored a shifted
+ * block, for reasons not found (diary 40). It is in v2.0.0.
  */
 
 
@@ -64,9 +62,6 @@ extern SPI_HandleTypeDef SD_SPI_PORT;
 #define SD_READ_TIMEOUT_MS      200U    /* wait for a data token */
 #define SD_SPI_TIMEOUT_MS       100U    /* one HAL transfer */
 
-/* Shorter transfers (the 16-byte CSD) aren't worth setting up a DMA for */
-#define SD_DMA_MIN_BYTES        64U
-
 
 static SD_CardType_t cardType = SD_CARD_NONE;
 static uint32_t sectorCount = 0;
@@ -78,7 +73,6 @@ volatile uint32_t sdLastError = 0;
 volatile uint32_t sdLastCardStatus = 0;
 volatile uint32_t sdLateResponse = 0;
 volatile uint32_t sdBusyMaxUs = 0;
-volatile uint8_t  sdUseDma = 0U;    /* polled by default: DMA writes fail now and then (diary 40) */
 volatile uint32_t sdRecoveries = 0;
 volatile uint32_t sdRecoveryFailures = 0;
 volatile uint32_t sdHalFailures = 0;
@@ -180,112 +174,6 @@ static uint8_t SD_Exchange(uint8_t out)
     }
 
     return in;
-}
-
-
-/*
- * Register-level DMA for the 512-byte data blocks (diary 39/40). CubeMX
- * sets up the channels and their DMAMUX requests (SPI2_RX on DMA1 Ch4,
- * SPI2_TX on Ch5); from then on this driver programs them directly and
- * HAL's SPI DMA functions aren't used.
- *
- * Every transfer is full duplex. A write receives into a dummy byte, so
- * the receive FIFO never overruns; a read sends a fixed 0xFF. No interrupt
- * is enabled: the CPU polls the receive channel, which finishes last, while
- * the audio and ring interrupts run as usual. HAL's transmit-only DMA, in
- * contrast, let the receive FIFO overrun every few bytes and took an SPI2
- * interrupt each time, and the card occasionally missed a block's start
- * token (diary 40).
- */
-#define SD_DMA_RX               DMA1_Channel4
-#define SD_DMA_TX               DMA1_Channel5
-#define SD_DMA_RX_DONE          DMA_ISR_TCIF4
-#define SD_DMA_ERRORS           (DMA_ISR_TEIF4 | DMA_ISR_TEIF5)
-#define SD_DMA_CLEAR            (DMA_IFCR_CGIF4 | DMA_IFCR_CGIF5)
-
-/* SD_STEP_*_DATA reply codes for a DMA failure */
-#define SD_DMA_FAIL_TIMEOUT     0xD1U
-#define SD_DMA_FAIL_BUS_ERROR   0xD2U
-
-static uint8_t dmaTxIdle = 0xFFU;   /* sent on every byte of a read (DMA reads it from RAM) */
-static uint8_t dmaRxDummy;          /* where a write's received bytes go */
-
-
-static void SD_DmaStop(void)
-{
-    SPI_TypeDef *const spi = SD_SPI_PORT.Instance;
-
-    CLEAR_BIT(spi->CR2, SPI_CR2_TXDMAEN | SPI_CR2_RXDMAEN);
-    SD_DMA_TX->CCR = 0U;
-    SD_DMA_RX->CCR = 0U;
-    DMA1->IFCR = SD_DMA_CLEAR;
-}
-
-
-/*
- * Send tx (or 0xFF bytes if NULL) while receiving into rx (or discarding if
- * NULL), length bytes, and wait until the last byte is in. On return SPI2
- * is idle, with DMA off, as HAL's polled calls expect it.
- */
-static SD_Status_t SD_DmaTransfer(const uint8_t *tx, uint8_t *rx, uint16_t length, uint8_t *failure)
-{
-    SPI_TypeDef *const spi = SD_SPI_PORT.Instance;
-    const uint32_t start = HAL_GetTick();
-    SD_Status_t status = SD_OK;
-
-    /* nothing must be left over from the polled byte before */
-    SD_CheckRxFifo();
-
-    SD_DmaStop();
-
-    /* byte frames: RXNE at one byte, no DMA packing */
-    SET_BIT(spi->CR2, SPI_CR2_FRXTH);
-    CLEAR_BIT(spi->CR2, SPI_CR2_LDMATX | SPI_CR2_LDMARX);
-
-    /* receive channel: peripheral to memory, byte sizes; above the transmit
-     * channel, so a received byte is always collected before the next */
-    SD_DMA_RX->CPAR = (uint32_t)&spi->DR;
-    SD_DMA_RX->CMAR = (rx != NULL) ? (uint32_t)rx : (uint32_t)&dmaRxDummy;
-    SD_DMA_RX->CNDTR = length;
-    SD_DMA_RX->CCR = DMA_CCR_PL_0 | ((rx != NULL) ? DMA_CCR_MINC : 0U);
-
-    /* transmit channel: memory to peripheral, byte sizes, low priority */
-    SD_DMA_TX->CPAR = (uint32_t)&spi->DR;
-    SD_DMA_TX->CMAR = (tx != NULL) ? (uint32_t)tx : (uint32_t)&dmaTxIdle;
-    SD_DMA_TX->CNDTR = length;
-    SD_DMA_TX->CCR = DMA_CCR_DIR | ((tx != NULL) ? DMA_CCR_MINC : 0U);
-
-    /* RM0440 order: receive request, then the channels, then transmit request */
-    SET_BIT(spi->CR2, SPI_CR2_RXDMAEN);
-    SD_DMA_RX->CCR |= DMA_CCR_EN;
-    SD_DMA_TX->CCR |= DMA_CCR_EN;
-    SET_BIT(spi->CR2, SPI_CR2_TXDMAEN);
-
-    while((DMA1->ISR & SD_DMA_RX_DONE) == 0U)
-    {
-        if((DMA1->ISR & SD_DMA_ERRORS) != 0U)
-        {
-            *failure = SD_DMA_FAIL_BUS_ERROR;
-            status = SD_ERR_SPI;
-            break;
-        }
-
-        if((HAL_GetTick() - start) >= SD_SPI_TIMEOUT_MS)
-        {
-            *failure = SD_DMA_FAIL_TIMEOUT;
-            status = SD_ERR_SPI;
-            break;
-        }
-    }
-
-    /* every byte received means every byte sent; BSY clears with the last */
-    while(((spi->SR & SPI_SR_BSY) != 0U) && ((HAL_GetTick() - start) < SD_SPI_TIMEOUT_MS))
-    {
-    }
-
-    SD_DmaStop();
-
-    return status;
 }
 
 
@@ -471,28 +359,14 @@ static SD_Status_t SD_ReceiveData(uint8_t *buffer, uint32_t length)
         return status;
     }
 
-    /* MOSI must stay high while the card sends: the DMA sends 0xFF from a
-     * fixed byte; polled, 0xFF is sent from the buffer in place (each byte
-     * goes out before its place is overwritten by the reply) */
-    if(sdUseDma && (length >= SD_DMA_MIN_BYTES))
-    {
-        uint8_t failure = 0U;
+    /* MOSI must stay high while the card sends: 0xFF goes out from the buffer
+     * in place (each byte is sent before the reply overwrites it) */
+    memset(buffer, 0xFF, length);
 
-        if(SD_DmaTransfer(NULL, buffer, (uint16_t)length, &failure) != SD_OK)
-        {
-            SD_RecordError(SD_STEP_READ_DATA, SD_ERR_SPI, failure);
-            return SD_ERR_SPI;
-        }
-    }
-    else
+    if(HAL_SPI_TransmitReceive(&SD_SPI_PORT, buffer, buffer, (uint16_t)length, SD_SPI_TIMEOUT_MS) != HAL_OK)
     {
-        memset(buffer, 0xFF, length);
-
-        if(HAL_SPI_TransmitReceive(&SD_SPI_PORT, buffer, buffer, (uint16_t)length, SD_SPI_TIMEOUT_MS) != HAL_OK)
-        {
-            SD_RecordError(SD_STEP_READ_DATA, SD_ERR_SPI, (uint8_t)HAL_SPI_GetError(&SD_SPI_PORT));
-            return SD_ERR_SPI;
-        }
+        SD_RecordError(SD_STEP_READ_DATA, SD_ERR_SPI, (uint8_t)HAL_SPI_GetError(&SD_SPI_PORT));
+        return SD_ERR_SPI;
     }
 
     opPhase = SD_PHASE_READ_END;
@@ -561,17 +435,7 @@ static SD_Status_t SD_TransmitData(const uint8_t *buffer, uint8_t token)
         return SD_OK;
     }
 
-    if(sdUseDma)
-    {
-        uint8_t failure = 0U;
-
-        if(SD_DmaTransfer(buffer, NULL, SD_SECTOR_SIZE, &failure) != SD_OK)
-        {
-            SD_RecordError(SD_STEP_WRITE_DATA, SD_ERR_SPI, failure);
-            return SD_ERR_SPI;
-        }
-    }
-    else if(HAL_SPI_Transmit(&SD_SPI_PORT, (uint8_t *)buffer, SD_SECTOR_SIZE, SD_SPI_TIMEOUT_MS) != HAL_OK)
+    if(HAL_SPI_Transmit(&SD_SPI_PORT, (uint8_t *)buffer, SD_SECTOR_SIZE, SD_SPI_TIMEOUT_MS) != HAL_OK)
     {
         SD_RecordError(SD_STEP_WRITE_DATA, SD_ERR_SPI, (uint8_t)HAL_SPI_GetError(&SD_SPI_PORT));
         return SD_ERR_SPI;

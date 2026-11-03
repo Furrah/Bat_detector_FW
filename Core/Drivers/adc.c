@@ -121,7 +121,6 @@ void HAL_ADC_ConvHalfCpltCallback(
 {
     if(hadc == &hadc1)
     {
-//    	HAL_GPIO_TogglePin(GPIOB,LED1_Pin);
 
         // raw block into the PSRAM ring, before the DSP runs
         PsramRing_PushBlock(&adcBuffer[0]);
@@ -141,7 +140,6 @@ void HAL_ADC_ConvCpltCallback(
     {
 
         adcConversionCount++;
-//    	HAL_GPIO_TogglePin(GPIOB,LED1_Pin);
 
         PsramRing_PushBlock(&adcBuffer[AUDIO_BLOCK_SIZE]);
 
