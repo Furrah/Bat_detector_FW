@@ -35,6 +35,7 @@
 #include "debug_link.h"
 #include "recorder.h"
 #include "dac.h"
+#include "diag_spi.h"
 #include "psram.h"
 #include "psram_ring.h"
 #include "sd_spi.h"
@@ -445,6 +446,15 @@ int main(void)
 
   HAL_GPIO_WritePin(DISPLAY_LED_GPIO_Port, DISPLAY_LED_Pin, GPIO_PIN_SET); // turn screen on
   ILI9341_FillScreen(ILI9341_BLACK);
+
+  // SPI2 (display and SD card) set-up traps CubeMX has fallen into before:
+  // NSS pulse mode, frames other than 8 bits, Low-speed pins (diag_spi.h)
+  if((Diag_SpiCheck(hspi2.Instance) != 0U)
+          || (Diag_GpioSlowPins(GPIOB, GPIO_PIN_13 | GPIO_PIN_14 | GPIO_PIN_15, GPIO_SPEED_FREQ_HIGH) != 0U))
+  {
+      ILI9341_WriteString(5, 200, "SPI2: config", Font_11x18, ILI9341_RED, ILI9341_BLACK);
+      HAL_Delay(5000);
+  }
 
   // Hold RECORD at power-up for the full 8 MB test. Waterfall_Init clears
   // the result off the screen afterwards.

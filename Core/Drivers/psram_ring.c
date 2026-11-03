@@ -33,6 +33,7 @@
 
 #include "main.h"
 #include "diag_cycles.h"
+#include "diag_spi.h"
 
 
 /*
@@ -160,25 +161,28 @@ static uint32_t spiCr2;
 
 
 
+/* Restart the timings (debug link 'Z'). Called at the end of the interrupt,
+ * after its own time is taken, so this work never counts as a worst case. */
+__STATIC_FORCEINLINE void PsramRing_ResetTiming(void)
+{
+    maxSelectCycles = 0U;
+    minSelectCycles = UINT32_MAX;
+    maxEntryCycles = 0U;
+    maxIsrCycles = 0U;
+    psramRingMaxSelectNs = 0U;
+    psramRingMinSelectNs = 0U;
+    psramRingMaxEntryNs = 0U;
+    psramRingMaxIsrNs = 0U;
+    psramRingOverTcem = 0U;
+    psramRingBursts = 0U;
+    psramRingResetStats = 0U;
+}
+
+
 /* Called from the interrupt once CE# is high, so none of this counts against
  * tCEM. Forced inline, like the helpers below. */
 __STATIC_FORCEINLINE void PsramRing_RecordTiming(uint32_t selectCycles, uint32_t entryCycles)
 {
-    if(psramRingResetStats != 0U)
-    {
-        maxSelectCycles = 0U;
-        minSelectCycles = UINT32_MAX;
-        maxEntryCycles = 0U;
-        maxIsrCycles = 0U;
-        psramRingMaxSelectNs = 0U;
-        psramRingMinSelectNs = 0U;
-        psramRingMaxEntryNs = 0U;
-        psramRingMaxIsrNs = 0U;
-        psramRingOverTcem = 0U;
-        psramRingBursts = 0U;
-        psramRingResetStats = 0U;
-    }
-
     psramRingBursts++;
 
     if(selectCycles > tcemCycles)
@@ -334,12 +338,13 @@ PsramRing_Status_t PsramRing_Start(void)
     /* The burst timing above assumes 8-bit frames at 42.5 MHz (/4), and the
      * interrupt handled is DMA2 Channel 1's. NSS pulse mode (NSSP, CubeMX's
      * default) idles SCK for 2 clocks after every byte to pulse the NSS pin,
-     * even with software NSS: 9.1 us bursts, over tCEM. */
+     * even with software NSS: 9.1 us bursts, over tCEM. SCK/MISO/MOSI (PB3-5)
+     * must be High speed: on Low the SPI hung at 42.5 MHz. */
     if((hdma_spi1_rx.Instance != DMA2_Channel1) || (hdma_spi1_tx.Instance != DMA2_Channel2)
             || ((spi->CR1 & SPI_CR1_BR) != SPI_BAUDRATEPRESCALER_4)
-            || ((spi->CR2 & SPI_CR2_DS) != SPI_DATASIZE_8BIT)
             || ((spi->CR2 & SPI_CR2_FRXTH) == 0U)
-            || ((spi->CR2 & SPI_CR2_NSSP) != 0U))
+            || (Diag_SpiCheck(spi) != 0U)
+            || (Diag_GpioSlowPins(GPIOB, GPIO_PIN_3 | GPIO_PIN_4 | GPIO_PIN_5, GPIO_SPEED_FREQ_HIGH) != 0U))
     {
         return PSRAM_RING_ERR_CONFIG;
     }
@@ -348,19 +353,9 @@ PsramRing_Status_t PsramRing_Start(void)
     HAL_NVIC_DisableIRQ(DMA2_Channel2_IRQn);
 
     /* The burst interrupt must be able to preempt everything else */
-    if(NVIC_GetPriority(PSRAM_RING_IRQn) != 0U)
+    if(!Diag_IrqAloneAtTop(PSRAM_RING_IRQn, PSRAM_RING_LAST_IRQn))
     {
         return PSRAM_RING_ERR_PRIORITY;
-    }
-
-    for(int32_t irq = 0; irq <= (int32_t)PSRAM_RING_LAST_IRQn; irq++)
-    {
-        if((irq != (int32_t)PSRAM_RING_IRQn)
-                && (NVIC_GetEnableIRQ((IRQn_Type)irq) != 0U)
-                && (NVIC_GetPriority((IRQn_Type)irq) == 0U))
-        {
-            return PSRAM_RING_ERR_PRIORITY;
-        }
     }
 
     tcemCycles = (PSRAM_TCEM_NS * (SystemCoreClock / 1000000U)) / 1000U;
@@ -382,10 +377,7 @@ PsramRing_Status_t PsramRing_Start(void)
     memset(txRead, 0, sizeof(txRead));
 
     /* drain anything the polled driver left, then hand the SPI to the DMA */
-    while((spi->SR & SPI_SR_FRLVL) != 0U)
-    {
-        (void)*(__IO uint8_t *)&spi->DR;
-    }
+    (void)Diag_SpiDrainRx(spi);
 
     SET_BIT(spi->CR2, SPI_CR2_RXDMAEN | SPI_CR2_TXDMAEN);
     SET_BIT(spi->CR1, SPI_CR1_SPE);
@@ -596,5 +588,10 @@ __RAM_FUNC void PsramRing_IRQHandler(void)
     {
         maxIsrCycles = isrCycles;
         psramRingMaxIsrNs = Diag_CyclesToNs(isrCycles);
+    }
+
+    if(psramRingResetStats != 0U)
+    {
+        PsramRing_ResetTiming();
     }
 }

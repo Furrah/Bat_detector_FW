@@ -26,6 +26,7 @@
 #include "main.h"
 #include "diag_cycles.h"
 #include "diag_error.h"
+#include "diag_spi.h"
 
 
 #define SD_SPI_PORT             hspi2
@@ -114,25 +115,12 @@ static void SD_StartOp(uint8_t command)
  */
 static void SD_CheckRxFifo(void)
 {
-    SPI_TypeDef *const spi = SD_SPI_PORT.Instance;
-    const uint32_t sr = spi->SR;
+    const uint32_t sr = Diag_SpiDrainRx(SD_SPI_PORT.Instance);
 
-    if((sr & (SPI_SR_FRLVL | SPI_SR_OVR)) != 0U)
+    if(sr != 0U)
     {
         Diag_RecordFailure(&sdStaleRx, &sdStaleRxFirst,
                 (sr & 0xFFFFU) | ((uint32_t)opPhase << 16) | ((uint32_t)opCommand << 24));
-
-        /* 8-bit reads pop one byte each (a wider read would pop two) */
-        for(uint32_t i = 0; (i < 8U) && ((spi->SR & SPI_SR_FRLVL) != 0U); i++)
-        {
-            (void)*(volatile uint8_t *)&spi->DR;
-        }
-
-        if((spi->SR & SPI_SR_OVR) != 0U)
-        {
-            (void)*(volatile uint8_t *)&spi->DR;    /* DR then SR clears OVR */
-            (void)spi->SR;
-        }
     }
 }
 

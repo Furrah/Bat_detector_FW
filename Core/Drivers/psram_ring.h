@@ -34,7 +34,8 @@ typedef enum
 {
     PSRAM_RING_OK = 0,
     PSRAM_RING_ERR_PRIORITY,    /* the burst interrupt doesn't have priority 0 to itself */
-    PSRAM_RING_ERR_CONFIG       /* SPI1 DMA isn't on DMA2 Ch1/Ch2, or SPI1 isn't 8-bit at /4 with NSSP off */
+    PSRAM_RING_ERR_CONFIG       /* SPI1 DMA isn't on DMA2 Ch1/Ch2, or SPI1 isn't 8-bit at /4 with NSSP off
+                                 * and High-speed pins */
 } PsramRing_Status_t;
 
 typedef enum

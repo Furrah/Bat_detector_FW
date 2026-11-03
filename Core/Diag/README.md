@@ -17,6 +17,7 @@ The DWT cycle counter exists on Cortex-M3, M4, M7 and M33 parts, but not on M0/M
 | `diag_port.h` | The device header, and `DIAG_INLINE`: helpers that always compile into their caller, so they're safe in interrupts that run from RAM. |
 | `diag_cycles.h` | Timing with the DWT cycle counter: start it, read it, convert cycles to µs or ns, and keep a worst case, best case or running average. |
 | `diag_error.h` | Failure records: a count, plus the details of the first failure packed into one word (`DIAG_PACK4`). One word shows whole in a watch window or a stats readout. |
+| `diag_spi.h/.c` | Start-up checks that read the registers CubeMX actually set: an SPI's frame size and NSS pulse mode, pins slower than a given speed, and an interrupt alone at the top priority. Plus a receive-FIFO drain for drivers that mix register access with HAL calls. |
 
 ## Patterns worth keeping
 
@@ -24,4 +25,6 @@ These are the lessons behind the code (bat detector diary, entries 32–43):
 - **Measure every time, keep the worst.** A worst case kept on every pass (`Diag_KeepMax`) catches the rare slow event that a one-off measurement misses. Pair it with a way to restart the measurement, so a reading covers only what follows.
 - **Keep the first failure, not the last.** Later failures are usually knock-on effects. Clear the record to catch the next one.
 - **Compare cycles, convert rarely.** In a hot interrupt, compare raw cycle counts and convert to ns only when a new worst case appears. That saves a division on every pass.
-- **Check the disassembly of a RAM-resident interrupt.** It must not call into flash. `DIAG_INLINE` forces inlining, but confirm it with `objdump`.
+- **Check the disassembly of a RAM-resident interrupt.** It must not call into flash. `DIAG_INLINE` forces inlining, but confirm it with `objdump`. Force-inline its own small helpers too: an unrelated change elsewhere in the file can make the compiler stop inlining them.
+- **Reset statistics outside the measured window.** A reset done inside the code being timed is counted in the next worst case.
+- **Check what CubeMX generated, at start-up.** Its defaults (NSS pulse mode, 4-bit frames, Low-speed pins, priority 0 for every new interrupt) each cost a debugging session. A check that reads the registers and refuses to run costs a few bytes.
