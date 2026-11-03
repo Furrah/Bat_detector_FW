@@ -24,6 +24,7 @@ Handheld, battery-powered ultrasonic bat detector covering the 20–120 kHz echo
 - Lookup tables are generated into `Core/DSP/Tables/` by `python Tools/gen_dsp_tables.py`: the Hann window, FFT twiddles, FFT unpack rotation and NCO sine. Don't edit them by hand. Rerun the script after changing `AUDIO_FFT_LENGTH` or `LUT_SIZE`; a static assert fails the build if a table is stale. Python 3 is installed.
 - Check `arm-none-eabi-size` after changes that add buffers or tables. When reading the .map, skip the "Discarded input sections" list at the top: symbols there were garbage-collected and use no memory.
 - Do not add the prebuilt CMSIS-DSP library: the static archive bakes in every twiddle table and overflowed flash by ~9 KB. The FFT is hand-rolled on purpose. If CMSIS-DSP is ever needed, use the source-only library so size-reduction defines work.
+  - Its CubeMX packs (X-CUBE-ALGOBUILD, FP-SNS-STAIOTCFT) were removed on Nov 3. Unticking their components wasn't enough: the packs stayed attached in the `.ioc` (`Mcu.ThirdParty0/1`), and CubeIDE's stored CubeMX defaults in `.cproject` (the `build.inputs` string) still listed the library. So every Generate Code put `-l:libarm_cortexM4lf_math.a` back, and a fresh clone failed to link. Both are clean now. If a library ever reappears in the linker settings, check those two places.
 - Buffer sizes, the sample rate and the FFT length come from `Core/Inc/pipeline_config.h` (`AUDIO_SAMPLE_RATE_HZ`, `AUDIO_BLOCK_SIZE`, `AUDIO_BUFFER_SIZE`, `AUDIO_FFT_LENGTH`, `AUDIO_LO_MAX_HZ`). Never hard-code them. Module constants such as `ADC_BUFFER_SIZE`, `DSP_BLOCK_SIZE` and `WF_SAMPLE_RATE_HZ` are aliases of it.
 - Shared ISR state (ping-pong FIFO counters etc.) needs short critical sections (`__disable_irq()` / `__set_PRIMASK()`). For FFT block handoff, drop rather than corrupt.
 - DSP correctness is verified by cross-checking against numpy `rfft` on captured raw samples. Offer a numpy check when changing DSP code.
@@ -130,7 +131,7 @@ Unused: PA7, PA10, PA15, PB1, PB9, PC13.
 - `sd_spi.c` (FATFS/Target): SPI-mode SD driver on SPI2, verified on hardware 2026-11-02 with a 16 GB SDHC card (diary 38). FatFS R0.12c is wired up through `user_diskio.c` with `_FS_TINY` on, LFN off and exFAT off.
   - Cards: FAT32 (FAT12/16 also mount) on an MBR partition table, SDHC of 32 GB or less. Format with the SD Association's SD Card Formatter (32 KB clusters, 4 MB-aligned), not Windows. exFAT, which every card over 32 GB ships with, doesn't mount: the boot screen shows "SD: not FAT32".
   - Everything is polled through HAL, data blocks included. Multi-sector writes (CMD25 with the ACMD23 pre-erase hint) are verified on hardware: 92.6 MB at 8 sectors per write, checked on the PC (diary 40).
-  - A register-level SPI2 DMA path was tried and removed in the clean-up: with it, the card occasionally missed a block's start token and wrote a shifted block, for reasons not found (diary 40). The code is in v2.0.0. CubeMX still sets up SPI2's DMA channels (DMA1 Ch4/Ch5); nothing uses them, and their interrupts are never enabled.
+  - A register-level SPI2 DMA path was tried and removed in the clean-up: with it, the card occasionally missed a block's start token and wrote a shifted block, for reasons not found (diary 40). The code is in v2.0.0. SPI2's DMA channels (DMA1 Ch4/Ch5) were removed in CubeMX too.
   - Recovery: a failed read or write re-initialises the card and retries once (`sdRecoveries`). `user_diskio.c` clears ST's once-only init flag, so a card that failed to start is retried on the next mount or open.
   - Diagnostics in `capture.py stats`: `sdErrorCount`, `sdLastError` (step, status, reply, command of the first failure), `sdLastCardStatus` (CMD13 after a failed write), `sdLateResponse` (the late-response probe), `sdBusyMaxUs`, and self-checks `sdHalFailures` and `sdStaleRx`.
 - The SD write test (`sd_bench.c`, `capture.py sdtest`) is archived (`Archive/`; it runs in v2.0.0). It chose the recorder's write scheme under the full recording load (diary 38–40): single-sector 0.88× (fails); 4 / 8 / 16 sectors 1.20× / 1.41× / 1.27× while catching up; 8 sectors 1.38× catching up and 1.93× caught up over 180 s, worst write 22 ms.
@@ -149,7 +150,7 @@ Unused: PA7, PA10, PA15, PB1, PB9, PC13.
   - PSRAM: hold RECORD at power-up for the full 8 MB test (~35 s).
   - SD: hold PLAYBACK at power-up for a 256 KB write/read speed test. It leaves `SDTEST.BIN` on the card. Measured W666 R648 kB/s; its 64-byte `f_write` calls make every transfer single-sector.
 - V2 port, still to do:
-  - TIM3 (V1's LO) is disconnected in code and `tim3_lo.c/.h` archived; untick TIM3 in CubeMX so `MX_TIM3_Init` goes too. It has no output pin, so it did nothing on V2.
+  - TIM3 (V1's LO) is gone: removed in CubeMX, and `tim3_lo.c/.h` archived. It had no output pin, so it did nothing on V2.
   - Recalibrate `DSP_GAIN` and `Waterfall_SetRange` for the 140× front end.
   - Drop the LO offset in `waterfall.c` `BinToDisplayFreq`. The FFT is of the raw ADC, so the axis is absolute; it only reads correctly today because `Waterfall_SetLOFrequency(0)` is the only call.
 
