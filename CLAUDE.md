@@ -16,8 +16,8 @@ Handheld, battery-powered ultrasonic bat detector covering the 20–120 kHz echo
 
 - CubeMX-generated files: only edit inside `/* USER CODE BEGIN */ … /* USER CODE END */` blocks. Anything outside is wiped when the .ioc is regenerated.
 - Make incremental, targeted changes scoped to the function or module in question, with the rationale stated. No whole-file rewrites.
-- RAM: about 760 B free with the USB debug capture, the PSRAM ring, playback, the WAV recorder and auto-tune built in (about 31.2 KB used, including a 2 KB stack, a 0.5 KB heap reservation, 1 KB of PSRAM-ring interrupt code that runs from RAM, and playback's 1 KB of block buffers). The debug capture's 8 KB buffer is shared with the recorder, so `DEBUG_CAPTURE 0` in `debug_link.h` doesn't free it; it frees only the module's code and ~0.5 KB of its state. No malloc, no large stack buffers.
-- Flash: 89.3 KB of 128 KB used at `-Og` (95 KB at `-O0` before the capture module). Large constant tables belong in flash rather than RAM.
+- RAM: about 970 B free with the USB debug capture, the PSRAM ring, playback, the WAV recorder and auto-tune built in (about 31 KB used, including a 2 KB stack, a 0.5 KB heap reservation, 1 KB of PSRAM-ring interrupt code that runs from RAM, and playback's 1 KB of block buffers). The debug capture's 8 KB buffer is shared with the recorder, so `DEBUG_CAPTURE 0` in `debug_link.h` doesn't free it; it frees only the module's code and ~0.5 KB of its state. No malloc, no large stack buffers.
+- Flash: 89.6 KB of 128 KB used at `-Og` (95 KB at `-O0` before the capture module). Large constant tables belong in flash rather than RAM.
 - Interrupt priorities: DMA2 Channel 1 (the PSRAM ring's burst interrupt) must be the only interrupt at priority 0; everything else at 1 or lower. `PsramRing_Start()` refuses to run otherwise (boot screen: "Ring: NVIC prio"). Diary entry 34.
   - CubeMX defaults a newly enabled peripheral interrupt to priority 0. It did that to SPI2's global interrupt (Nov 2); check every new interrupt's priority after generating.
   - `__disable_irq()` blocks priority 0 too. Keep masked sections in code that runs while the ring is busy to a few dozen instructions: a masked section that delays a burst's end stretches CE#. Bursts have ~3.5 µs of slack (entry 36).
@@ -89,12 +89,23 @@ Unused: PA7, PA10, PA15, PB1, PB9, PC13.
   - Modes: hold PLAYBACK for 0.8 s to switch between manual (the knob sets the LO) and auto ("AUTO 43.5kHz" in the header; the knob is ignored). A short PLAYBACK press acts on release. Starts in manual.
   - Model of the chain on synthetic calls (diary 45): pipistrelle → LO 44.4 kHz, horseshoe 82 → 80.6 kHz, noise → no move; 1 mis-tune in 30 runs with recorder-like frame drops.
   - Stats: `autoTuneCalls`, `autoTuneRetunes`, `autoTuneLastHz`.
-- `debug_link.c` (Core/Src; header in Core/Inc so dsp.c and the USB code can include it): USB CDC debug capture, built 2026-10-30.
-  - The PC sends one byte: `I` info, `R` a raw 4096-sample snapshot, `E` / `S` start / stop one energy record per block. Replies are CRC-32 framed; the format is at the top of `debug_link.c`.
+- Code layout since the Nov 3 clean-up:
+  - **`main.c`:** CubeMX init, then the audio modules, the display, the power-up checks and the audio start. The loop is five polls: `UI_Poll`, `DebugLink_Poll`, `Recorder_Poll`, `FFT_Process`, `UI_PollDisplay`.
+  - **`ui.c`:** the front panel, i.e. buttons (debounce, long press), knobs, LEDs, the header line, the waterfall rows with auto-tune, and the battery readout.
+  - **`boot_checks.c`:** the power-up checks for SPI2, PSRAM (with the ring start) and SD.
+  - **`Core/Diag/`:** a self-contained diagnostics library for reuse in other STM32 projects; its README says how.
+    - `diag_cycles.h`: DWT timing.
+    - `diag_error.h`: first-failure records.
+    - `diag_spi`: SPI, pin-speed and NVIC start-up checks, and the RX drain.
+    - `diag_stats`: the stats table.
+    - `diag_link`: the framed USB link; `Tools/diaglink.py` is its PC side.
+  - **`Archive/`:** files no longer built.
+- `debug_link.c` (Core/Src; header in Core/Inc so dsp.c and the USB code can include it): USB CDC debug capture, built 2026-10-30. Since Nov 3 its framing, command queue and stats commands are `Core/Diag/diag_link.c`. It keeps the captures, the 8 KB buffer and the USB transport. The wire format is unchanged.
+  - The PC sends one byte: `I` info, `R` a raw 4096-sample snapshot, `E` / `S` start / stop one energy record per block. Replies are CRC-32 framed; the format is at the top of `diag_link.h`.
   - Also: `M` ring read-back, `N` / `T` the stats table and its values, `Z` restart the worst-case timings, `F` capture one FFT frame and its result.
   - FFT check: `python -I Tools/capture.py fftcheck --count 10` compares `FFT_Process` with numpy `rfft` on the same raw frame; passes below 1e-4 of the largest bin. Measured 6.8e-8 (Nov 2, after the `-O2` change).
-  - Stats: `python -I Tools/capture.py stats` reads every Live Expressions counter over USB (DSP and FFT timing, DAC, PSRAM ring, playback, detector) and flags any out of limits; `--window 30` restarts the worst-case timings first and reads them 30 s later. The table is `debugStats[]` in `debug_link.c`; add an entry there and the PC picks it up.
-  - Hooks: `DebugLink_AddBlock` in `DSP_ProcessBlock`, `DebugLink_OnReceive` in `usbd_cdc_if.c` `CDC_Receive_FS`, `DebugLink_Poll` in the main loop.
+  - Stats: `python -I Tools/capture.py stats` reads every Live Expressions counter over USB (DSP and FFT timing, DAC, PSRAM ring, playback, detector) and flags any out of limits; `--window 30` restarts the worst-case timings first and reads them 30 s later. The table is in `stats_table.c` (`DIAG_STAT_U32(var)` and so on); add an entry there and the PC picks it up.
+  - Hooks: `DebugLink_Init` at start-up, `DebugLink_AddBlock` in `DSP_ProcessBlock`, `DebugLink_OnReceive` in `usbd_cdc_if.c` `CDC_Receive_FS`, `DebugLink_Poll` in the main loop.
   - `DebugLink_LendBuffer()` / `DebugLink_ReturnBuffer()` lend its 8 KB buffer to the WAV recorder ("lent" mode: `R`/`E`/`M`/`F` are refused, and an unplugged USB doesn't reclaim it). With `DEBUG_CAPTURE 0` they hand out a plain 8 KB buffer.
   - PC side: `python -I Tools/capture.py info|raw|energy --label <note>` saves `Captures/*.npz`. `python -I Tools/analyse_capture.py <file.npz>` prints the analysis and writes a PNG: spectrum lines, noise, the detector's predicted input, energy periodicities, and an offline detector replay with a threshold sweep. Needs `python -m pip install pyserial numpy matplotlib` (installed).
   - Keep `DETECTOR` in `analyse_capture.py` in step with `bat_detect.c`; the replay reports if it disagrees with the board.
@@ -120,7 +131,9 @@ Unused: PA7, PA10, PA15, PB1, PB9, PC13.
   - The burst interrupt's code is marked `__RAM_FUNC` (runs from RAM), and `psram_ring.c` builds at `-O2` via a `#pragma`. It costs 2.3–2.5 µs of CPU per burst; from flash at `-Og` it was 4 µs and overran the DSP. `DMA2_Channel1_IRQHandler` returns before `HAL_DMA_IRQHandler`.
   - `PsramRing_PushBlock` is called from the ADC callbacks in `adc.c`. `PsramRing_ReadBlock` queues a read by block number (queue of 16, since Nov 2), and writes go before reads.
   - Live Expressions: `psramRingMaxSelectNs` (must stay below 8000), `psramRingOverTcem`, `psramRingLateBlocks` and `psramRingFaults` (must stay 0), `psramRingBlocks`, `psramRingReads`.
-  - Timing diagnostics: `psramRingMinSelectNs`, `psramRingMaxEntryNs` (CE# low to interrupt start), `psramRingMaxIsrNs` (CPU per burst), `psramRingBursts`. Write 1 to `psramRingResetStats` to restart them.
+  - Timing diagnostics: `psramRingMinSelectNs`, `psramRingMaxEntryNs` (CE# low to interrupt start), `psramRingMaxIsrNs` (CPU per burst), `psramRingBursts`. Write 1 to `psramRingResetStats` to restart them. The reset runs at the end of the burst interrupt, after its own time is taken; it used to run inside the timed part, and inflated `psramRingMaxIsrNs` by ~0.2 µs after every `stats --window` (fixed Nov 3).
+  - The burst helpers (`PsramRing_BlockAddress`, `PsramRing_PutHeader`, `PsramRing_RecordTiming`, `PsramRing_ResetTiming`) are forced inline. Left to GCC, an unrelated size change made two of them calls: +45 cycles a burst (Nov 3). After touching `psram_ring.c`, check the RAM functions' disassembly: `PsramRing_IRQHandler` should call only `PsramRing_StopDma`, `PsramRing_StartBurst` and the fault path.
+  - `PsramRing_Start()` refuses to run unless SPI1 is 8-bit at /4 with NSS pulses off, PB3–5 are High speed, and DMA2 Ch1 is alone at priority 0 (`diag_spi.h`).
   - Verify with `python -I Tools/capture.py verify --count 50`: debug link `M` reads the last snapshot back from the ring and the PC compares it bit for bit. It fails while playback has the ring paused.
   - `PsramRing_SetPaused()` stops recording (reads still run); `PsramRing_GetWrittenBlocks()` gives the newest readable block + 1.
   - Block numbers carry straight on across a pause. `PsramRing_GetResumeBlock()` gives the first block after the last one, so a pre-trigger never joins audio from either side of a playback.
@@ -146,7 +159,8 @@ Unused: PA7, PA10, PA15, PB1, PB9, PC13.
   - PLAYBACK is refused while a recording is open ("PLAY: busy"), RECORD during playback ("REC: playing"). The display shows "REC   1:23" in the LO readout's place.
   - Counters in `capture.py stats`: `recFile`, `recBlocks`, `recMaxBacklog`, `recMaxWriteUs`, `recMaxSyncUs`, `recReadFailures` (must stay 0), `recLastEnd`. Measured: slowest write 15.3 ms, slowest sync 6.1 ms, most backlog 4917 blocks (the pre-trigger).
   - `blockCount` − `psramRingBlocks` is how many blocks the ring spent paused (playback).
-- Boot checks run before the audio starts:
+- Boot checks run before the audio starts (`boot_checks.c`):
+  - SPI2 (display and SD): 8-bit frames, NSS pulses off, PB13–15 High speed; "SPI2: config" on screen otherwise.
   - PSRAM: hold RECORD at power-up for the full 8 MB test (~35 s).
   - SD: hold PLAYBACK at power-up for a 256 KB write/read speed test. It leaves `SDTEST.BIN` on the card. Measured W666 R648 kB/s; its 64-byte `f_write` calls make every transfer single-sector.
 - V2 port, still to do:

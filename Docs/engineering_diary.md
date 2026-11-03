@@ -896,6 +896,65 @@ Entries are in order, with the newest at the bottom. Decisions that are agreed b
   - Feed a new feature from data another module already computes before adding a pipeline for it. Here the waterfall's rows saved an FFT and 2 KB of RAM.
   - Test against realistic data loss. A drop pattern that locks onto the signal's rhythm exaggerates failures (1 in 6 against 1 in 30), and real call intervals vary anyway.
 
+## 2026-11-03: Clean-up after v2.0.0
+
+### 46. Debug code into a reusable diagnostics library; main.c split; dead code archived (Nov 3)
+- **Decision:** After the v2.0.0 release, clean the code without changing behaviour:
+  - Archive what's no longer built.
+  - Pull the diagnostics out of the modules into `Core/Diag/`, a self-contained library meant to be copied into future STM32 projects.
+  - Split `main.c`'s 260-line loop into a front-panel module and the power-up checks.
+- **Context:** The code was "full of debug code and quite unreadable":
+  - Hand-written cycle-counter timing was repeated in six modules.
+  - One 814-line file held both a generic framed USB link and this project's captures, plus a table that had to know every module's counters.
+  - The main loop inlined buttons, knobs, LEDs, labels and the battery readout, with mixed tab/space indentation.
+- **What moved where:**
+  - **`Archive/`** (not built, kept on disk, see its README):
+    - the SD write test, and its PC side `capture.py sdtest`;
+    - V1's TIM3 LO;
+    - the touch driver;
+    - an AGC that was never connected.
+  - **Removed outright, recoverable from the v2.0.0 tag:** the SD driver's dead DMA path. In CubeMX: TIM3, SPI2's DMA channels, and the two software packs that dragged in the prebuilt CMSIS-DSP library.
+  - **`Core/Diag/`:**
+    - `diag_cycles.h`: DWT timing, all inline.
+    - `diag_error.h`: first-failure records.
+    - `diag_spi`: register-level start-up checks for the CubeMX traps of entries 14, 34 and 35, and the RX drain.
+    - `diag_stats`: the counters table.
+    - `diag_link`: the framed link, transport-agnostic. `Tools/diaglink.py` is its PC side.
+  - **Project files:**
+    - `stats_table.c`: the counters;
+    - `debug_link.c`: the captures and the USB transport (814 → 550 lines);
+    - `ui.c`: the front panel;
+    - `boot_checks.c`: the power-up checks.
+    - `main.c` keeps CubeMX's init and a five-call loop.
+- **What the board checks found** (each step flashed and measured: stats, PSRAM verify, FFT check, a recording):
+  1. **Lost inlining.** Removing the PSRAM ring's private ns-conversion function changed the file's size enough that GCC stopped inlining two helpers into the burst interrupt's `PsramRing_StartBurst`. That cost about 45 cycles per burst, from RAM.
+     - It showed as the interrupt's worst case rising from 2.36 to 2.52–2.59 µs.
+     - Compiling the file before and after and diffing the interrupt's machine code pinned it down.
+     - The helpers are now forced inline, and the linked RAM code matches v2.0.0's.
+  2. **A measurement artefact.** The ring's timing reset (`Z`, `stats --window`) ran inside the timed part of the interrupt. The first burst after every reset recorded the reset's own work, about 0.2 µs.
+     - A power-cycle reading with no reset showed the true 2.36 µs.
+     - The reset now runs after the interrupt's timing is taken: the window reads 2.28 µs.
+  3. **CubeMX kept bringing back the DSP library.** Unticking a software pack's components leaves the pack attached to the `.ioc` (`Mcu.ThirdParty0/1`).
+     - CubeIDE also keeps a record of CubeMX's defaults inside `.cproject` (the `build.inputs` string). It re-adds anything listed there on every Generate Code.
+     - Both had to be cleaned by hand before a fresh clone could link.
+- **Costs:**
+  - Flash: 94.3 → 91.8 KB.
+  - RAM: about 540 → 970 B free.
+  - The generic link adds about 0.5 KB of flash for its function pointers and config. The main loop's locals became `ui.c`'s statics (+56 B RAM, with less stack in use).
+- **Alternatives considered:**
+  - Giving the recorder the 8 KB buffer and having the link borrow it: deferred. It changes which side wins when both want the buffer.
+  - Per-module stats tables: rejected. The link would need scatter-gather frames or a RAM copy of the table.
+- **Outcome:**
+  - Steps 1, 2a and 2b passed on the board.
+  - The link split (2c), the `main.c` split (3) and the docs were batched into one final board check. The user asked for fewer flash cycles.
+  - The PC side was already checked against the old firmware: the wire format is unchanged.
+- **Lessons for future designs:**
+  - Force-inline the helpers of a time-critical RAM-resident interrupt. Inlining left to the compiler can flip after an unrelated edit, and only a disassembly diff or a cycle measurement shows it.
+  - Reset statistics outside the window they measure.
+  - A worst case is only comparable with one taken the same way. "From boot" and "after a reset" differed by the reset's own cost.
+  - CubeMX state lives in three places: the `.ioc`, `.mxproject` and CubeIDE's `.cproject` defaults record. Removing a component means checking all three.
+  - Batch low-risk refactor steps, and check them together on the board. A flash per small step cost more user time than the risk warranted.
+
 ---
 
 ## Planned decisions (agreed, not built yet)
@@ -993,6 +1052,9 @@ Entries are in order, with the newest at the bottom. Decisions that are agreed b
 - Replay recorded data through every candidate rule before choosing one (entry 44).
 - Feed a new feature from data another module already computes before adding a pipeline (entry 45).
 - Test against realistic data loss: a pattern that locks onto the signal's rhythm exaggerates failures (entry 45).
+- Force-inline the helpers of a time-critical RAM-resident interrupt; compiler inlining can flip after an unrelated edit (entry 46).
+- Reset statistics outside the window they measure, and compare worst cases taken the same way (entry 46).
+- CubeMX state lives in the .ioc, .mxproject and CubeIDE's .cproject defaults record: check all three when removing a component (entry 46).
 
 ---
 
