@@ -973,13 +973,13 @@ Entries are in order, with the newest at the bottom. Decisions that are agreed b
   - `adc.c` has one block callback instead of a half and a full one, both set to the same function.
   - `waterfall.c` lost its LO offset and LO label. The axis was always absolute, and `ui.c` already owns the header line.
   - `main.c` now starts DAC, then ADC, then TIM2, the order CLAUDE.md always said was right. It used to start TIM2 first.
-  - USB, CRS and HSI48 are to come out in CubeMX next: they served only the debug link. Until then they're compiled in but unused.
+  - USB, CRS and HSI48 removed in CubeMX (Nov 4): they served only the debug link. CubeMX deleted `USB_Device/`, the USB library and the HAL's PCD driver.
 - **Bugs:** none found in the shipped code. The rewrite introduced one, caught before building by diffing against the original: the first draft of the SD multi-block read had lost its CMD12 (stop transmission).
-- **Costs:** none in memory, the reverse: flash 89.6 → 78.4 KB, and RAM free about 970 B → 2.0 KB, with USB still compiled in. USB holds about 4.5 KB more. Losing the instrumentation means the timing margins can no longer be read off a running board on this branch. For that, flash `v2`.
+- **Costs:** none in memory, the reverse: flash 89.6 → 65.7 KB, and RAM free about 970 B → 6.8 KB. The instrumentation accounted for 11.2 KB of flash and 1.1 KB of RAM; USB for 12.7 KB and 4.8 KB. Losing the instrumentation means the timing margins can no longer be read off a running board on this branch. For that, flash `v2`.
 - **Alternatives considered:**
   - `#if DEBUG` around the instrumentation: rejected. It is the conditional code that makes files hard to read.
   - Deleting the diagnostics outright: rejected. `v2` and `Archive/` keep them, and `Core/Diag` stays reusable for other projects.
-- **Outcome:** The board was checked on Nov 4, and the user confirmed it works as before. CubeIDE's build was byte-for-byte the size of the command-line build (80,284 B flash, 30,720 B RAM).
+- **Outcome:** The board was checked on Nov 4, and the user confirmed it works as before. CubeIDE's build was byte-for-byte the size of the command-line build (80,284 B flash, 30,720 B RAM). That check was with USB still compiled in. The USB removal afterwards builds clean, but hasn't been run on the board yet.
 - **Lessons for future designs:**
   - Instrumentation earns its keep during bring-up: every number in entries 34–46 came from it. Once the numbers are known, it costs more in reading time than it saves. Plan from the start for a branch or build that drops it.
   - Most of the bulk was diagnosis of failures that are now understood (SD start tokens, CE# timing). Code written to find a fault should leave once the fault is found.

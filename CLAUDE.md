@@ -16,8 +16,8 @@ Handheld, battery-powered ultrasonic bat detector covering the 20–120 kHz echo
 
 - CubeMX-generated files: only edit inside `/* USER CODE BEGIN */ … /* USER CODE END */` blocks. Anything outside is wiped when the .ioc is regenerated.
 - Make incremental, targeted changes scoped to the function or module in question, with the rationale stated. No whole-file rewrites.
-- RAM: 2.0 KB free (30.0 of 32 KB used), with USB still compiled in. Removing it in CubeMX frees about 4.5 KB more: its handles, 2 KB of CDC buffers and the descriptors. That includes a 2 KB stack, a 0.5 KB heap reservation, ~1 KB of PSRAM-ring interrupt code that runs from RAM, the recorder's 8 KB slot buffer and playback's 1 KB. No malloc, no large stack buffers.
-- Flash: 78.4 KB of 128 KB used at `-Og`, USB still compiled in (89.6 KB on `v2` with the debug link and USB). Large constant tables belong in flash rather than RAM.
+- RAM: 6.8 KB free (25.8 of 32 KB used). That includes a 2 KB stack, a 0.5 KB heap reservation, ~1 KB of PSRAM-ring interrupt code that runs from RAM, the recorder's 8 KB slot buffer and playback's 1 KB. No malloc, no large stack buffers.
+- Flash: 65.7 KB of 128 KB used at `-Og` (89.6 KB on `v2` with the debug link and USB). Large constant tables belong in flash rather than RAM.
 - Interrupt priorities: DMA2 Channel 1 (the PSRAM ring's burst interrupt) must be the only interrupt at priority 0; everything else at 1 or lower. `PsramRing_Start()` refuses to run otherwise (boot screen: "Ring: NVIC prio"). Diary entry 34.
   - CubeMX defaults a newly enabled peripheral interrupt to priority 0. It did that to SPI2's global interrupt (Nov 2); check every new interrupt's priority after generating.
   - `__disable_irq()` blocks priority 0 too. Keep masked sections in code that runs while the ring is busy to a few dozen instructions: a masked section that delays a burst's end stretches CE#. Bursts have ~3.5 µs of slack (entry 36).
@@ -137,7 +137,7 @@ To measure something (DSP load, CE# time, FFT against numpy), use `v2`, or port 
 - **`ui.c`:** the front panel: buttons (debounce, long press), knobs (ADC2 scan of LO pot, volume, V_BAT/2 every 10 ms), LEDs, the header line, waterfall rows with auto-tune, and the battery readout ("BAT" over "3.9", top right). Volume is square-law. The LO label is fixed at 13 characters so it clears the battery readout.
 - **`boot_checks.c`:** SPI2 set-up (8-bit, NSSP off, PB13–15 High speed: "SPI2: config"), PSRAM reset/ID and ring start ("PSRAM: no reply", "Ring: NVIC prio", ...), SD mount (type and size, or why not).
 - **`main.c`:** CubeMX init, then the modules, the display, the boot checks and the audio start. The loop is `UI_Poll`, `Recorder_Poll`, `FFT_Process`, `UI_PollDisplay`.
-- **USB:** unused on this branch; it only served the debug link. Still to remove in CubeMX: USB_DEVICE, the USB peripheral, CRS and HSI48. The hardware is unchanged.
+- **USB:** removed on this branch (Nov 4). USB_DEVICE, the USB peripheral, CRS and HSI48 are off in CubeMX; they only served the debug link. The hardware is unchanged. `main.c`'s per-file include list in `.cproject` still names the USB and `Core/Diag` folders: harmless (GCC skips missing folders), tidy it with CubeIDE closed.
 - **V2 port, still to do:** recalibrate `DSP_GAIN` and `Waterfall_SetRange` for the 140× front end.
 
 Bugs already fixed — do not reintroduce:

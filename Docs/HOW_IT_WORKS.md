@@ -543,13 +543,14 @@ The PSRAM interrupt must be alone at 0. `PsramRing_Start()` checks it, because C
 | FatFS (volume and file objects) | ~600 | FatFS, `recorder.c` |
 | DSP output block | 512 | `dsp.c` |
 | Heap reserve | 512 | linker script |
-| Everything else (HAL handles, state, tables) | ~2,000 | |
+| Everything else (HAL handles, state, tables) | ~2,300 | |
+| **Used** | **25,784 of 32,768 (6.8 KB free)** | |
 
 No `malloc`, and no big buffers on the stack. Every buffer is a fixed static array, so the linker's map file shows exactly where the memory goes.
 
 ### Flash (128 KB)
 
-The code plus the constant tables: the FFT window, twiddles, unpack rotation and NCO sine, generated into `Core/DSP/Tables/` by `Tools/gen_dsp_tables.py`. A static assert stops the build if a table doesn't match `AUDIO_FFT_LENGTH` or `LUT_SIZE`.
+About 66 KB is used: the code plus the constant tables: the FFT window, twiddles, unpack rotation and NCO sine, generated into `Core/DSP/Tables/` by `Tools/gen_dsp_tables.py`. A static assert stops the build if a table doesn't match `AUDIO_FFT_LENGTH` or `LUT_SIZE`.
 
 ---
 
