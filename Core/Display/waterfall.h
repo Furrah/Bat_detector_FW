@@ -1,86 +1,52 @@
 /*
- * display.h
+ * waterfall.h
  *
- *  Created on: 24 Aug 2026
- *      Author: Joe Spencer
+ * The scrolling spectrogram on the ILI9341, in portrait. Frequency runs
+ * across (240 columns, 0 to 125 kHz, ~0.52 kHz each) and time runs down:
+ * each new row enters at the top of the scroll area and older rows move
+ * down. The scrolling is done by the display itself (VSCRDEF/VSCRSADD), so
+ * a row costs one 240-pixel write.
+ *
+ * The FFT (fft.h) runs faster than the rows, so each column keeps the peak
+ * of every FFT frame since the last row: a call that lasts one frame still
+ * shows. The FFT is of the raw ADC, so the axis is absolute frequency
+ * whatever the LO is.
+ *
+ * Screen layout, top to bottom: a 34-pixel header (ui.c writes the LO,
+ * messages and battery there), the scroll area, a 14-pixel axis strip.
  */
 
 #ifndef DISPLAY_WATERFALL_H_
 #define DISPLAY_WATERFALL_H_
 
-
-
 #include <stdint.h>
 
-#include "pipeline_config.h"
+#define WF_SCREEN_W     240     /* columns: the frequency axis */
+#define WF_SCREEN_H     320
+#define WF_TFA          34      /* fixed header, pixels */
+#define WF_BFA          14      /* fixed axis strip at the bottom */
+#define WF_VSA          (WF_SCREEN_H - WF_TFA - WF_BFA)     /* scroll area */
 
-// Native portrait orientation matches ILI9341_ROTATION already in use
-// (MADCTL_MX | BGR) -- no MV bit, so hardware scroll behaves correctly.
-#define WF_SCREEN_W   240   // frequency axis (columns)
-#define WF_SCREEN_H   320   // full panel height
-
-// Split the panel height into a fixed header (LO readout, Font_16x26),
-// the scrolling waterfall, and a fixed footer (frequency-axis ticks,
-// Font_7x10). Must sum to WF_SCREEN_H.
-#define WF_TFA        34
-#define WF_BFA        14
-#define WF_VSA        (WF_SCREEN_H - WF_TFA - WF_BFA)
-
-// Sample rate and FFT length come from pipeline_config.h, so they always
-// match fft.c -- used to convert a screen column back to a baseband
-// frequency for the axis labels.
-#define WF_SAMPLE_RATE_HZ   AUDIO_SAMPLE_RATE_HZ
-#define WF_FFT_LENGTH       AUDIO_FFT_LENGTH
-
-// Number of leading FFT bins to exclude from the plot: DC (bin 0) and its
-// local leakage into neighbouring bins. These dominate the magnitude scale
-// without carrying signal, so leaving them in flattens everything else
-// toward the palette floor. Start at 2 (bins 0 and 1); drop to 1 if bin 1
-// turns out to carry real signal on your setup.
-#define WF_SKIP_BINS   2
-
-// Call once at startup, after ILI9341_Init().
+/* After ILI9341_Init: clears the screen and sets up the scroll area */
 void Waterfall_Init(void);
 
-// Sets the local-oscillator frequency and redraws both the top LO
-// readout and the bottom frequency-axis ticks. Call once at startup with
-// your initial LO setting, and again wherever you currently retune it --
-// NOT every flush, since WriteString is slow and the axis doesn't need
-// to change at 25Hz.
-//
-// ASSUMES upper-sideband mixing (displayed_freq = lo_freq_hz +
-// baseband_freq). If your front end is lower-sideband or I/Q, flip the
-// '+' to a '-' in BinToDisplayFreq() inside waterfall.c.
-void Waterfall_SetLOFrequency(uint32_t lo_freq_hz);
+/* The dB range the palette spans: floor and below is black, ceiling and above red */
+void Waterfall_SetRange(float lowDb, float highDb);
 
-// Sets the dB range the colour palette maps across. Anything at/below
-// floor_db is black, anything at/above ceil_db is white. Tune these once
-// you know your mic's actual noise floor and typical call levels.
-void Waterfall_SetRange(float floor_db, float ceil_db);
+/* Draw the kHz ticks in the bottom strip (once, after Waterfall_Init) */
+void Waterfall_DrawAxis(void);
 
-// Call this every time a new FFT frame is ready (i.e. at your ~192kHz/1024
-// FFT cadence). Takes LINEAR magnitude straight from fftMagnitude[] -- the
-// dB conversion happens internally. Just peak-holds into an accumulator --
-// cheap, no SPI traffic -- so short bat calls aren't lost between display
-// rows. n_bins is whatever your real-unpacking stage produces (check
-// FFT_NUM_BINS in fft.h); it's re-binned onto WF_SCREEN_W columns internally.
-void Waterfall_Accumulate(const float *mag_linear, uint16_t n_bins);
+/* Each FFT frame: peak-hold fftMagnitude[] (linear) into the row being built */
+void Waterfall_Accumulate(const float *magnitude, uint16_t bins);
 
-// Call this at your target display refresh rate (~20-30Hz is plenty for a
-// human to read -- do NOT call it once per FFT frame, and don't call it
-// from inside your ADC/DAC DMA callback since it blocks on SPI). Pushes
-// the accumulated peak row to the display and resets the accumulator.
-void Waterfall_FlushRow(void);
-
-// The row being accumulated: each column's peak level in dB (columns with
-// nothing louder sit at the palette floor), and in *frames how many FFT
-// frames went into it (0 when the main loop had no time for the FFT).
-// Read it just before Waterfall_FlushRow, which clears it. Used by
-// auto-tune (autotune.h).
+/* The row being built: each column's peak in dB, and in *frames how many
+ * FFT frames went into it. Read it before Waterfall_FlushRow clears it. */
 const float *Waterfall_GetRow(uint16_t *frames);
 
-// The absolute frequency (Hz) of a screen column; a fractional column
-// interpolates. Matches Waterfall_Accumulate's mapping of bins to columns.
+/* The frequency (Hz) at a column; a fractional column interpolates */
 float Waterfall_ColumnToHz(float column);
+
+/* Every 40 ms: draw the row at the top of the scroll area and start a new one */
+void Waterfall_FlushRow(void);
 
 #endif /* DISPLAY_WATERFALL_H_ */

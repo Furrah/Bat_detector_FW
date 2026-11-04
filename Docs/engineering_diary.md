@@ -955,6 +955,36 @@ Entries are in order, with the newest at the bottom. Decisions that are agreed b
   - CubeMX state lives in three places: the `.ioc`, `.mxproject` and CubeIDE's `.cproject` defaults record. Removing a component means checking all three.
   - Batch low-risk refactor steps, and check them together on the board. A flash per small step cost more user time than the risk warranted.
 
+## 2026-11-03: The essential branch
+
+### 47. An `essential` branch: the product code without the bring-up instrumentation (Nov 3)
+- **Decision:** Keep `v2` as the instrumented reference. Make a branch, `essential`, with only the code the product needs:
+  - remove the USB debug link, the stats table, every timing and health counter, `Core/Diag`, the PSRAM pattern tests, the SD speed test and USB itself;
+  - keep the behaviour identical;
+  - write `Docs/HOW_IT_WORKS.md`, with diagrams, to explain it.
+- **Context:** Even after entry 46 the code was hard to follow. `psram.c` was 519 lines for what the product uses as a reset and an ID check. Diagnostics were threaded through every driver: the SD driver had 11 failure counters, phase tracking, a late-response probe and a card-status read-back. The user wanted to be able to understand the project.
+- **What changed (lines, `.c` + `.h`):**
+  - `psram` 519 → 156: reset, ID, done. The address-line and 8 MB tests, `PSRAM_Write/Read` and the CE# timing are gone; the ring does all transfers.
+  - `sd_spi` 935 → 585: the protocol, the timeouts and the re-init-and-retry recovery stay; the diagnostics go.
+  - `psram_ring` 713 → 564: all timing and fault counters gone. The start-up checks are now ten plain register comparisons instead of `diag_spi` calls.
+  - `fft` 377 → 196 (the capture hooks and timing), `dsp_filters` 241 → 84 (the never-connected notch filter and DC blocker), `bat_detect` 276 → 175 (the dB debug variables), `boot_checks` 312 → 134, `adc` 239 → 137, `waterfall` 309 → 240.
+  - Modules in all: 6,237 → 4,334 lines, plus 1,487 lines of debug C moved to `Archive/` with the PC capture tools.
+  - The recorder owns its 8 KB slot buffer instead of borrowing the debug link's.
+  - `adc.c` has one block callback instead of a half and a full one, both set to the same function.
+  - `waterfall.c` lost its LO offset and LO label. The axis was always absolute, and `ui.c` already owns the header line.
+  - `main.c` now starts DAC, then ADC, then TIM2, the order CLAUDE.md always said was right. It used to start TIM2 first.
+  - USB, CRS and HSI48 are to come out in CubeMX next: they served only the debug link. Until then they're compiled in but unused.
+- **Bugs:** none found in the shipped code. The rewrite introduced one, caught before building by diffing against the original: the first draft of the SD multi-block read had lost its CMD12 (stop transmission).
+- **Costs:** none in memory, the reverse: flash 89.6 → 78.4 KB, and RAM free about 970 B → 2.0 KB, with USB still compiled in. USB holds about 4.5 KB more. Losing the instrumentation means the timing margins can no longer be read off a running board on this branch. For that, flash `v2`.
+- **Alternatives considered:**
+  - `#if DEBUG` around the instrumentation: rejected. It is the conditional code that makes files hard to read.
+  - Deleting the diagnostics outright: rejected. `v2` and `Archive/` keep them, and `Core/Diag` stays reusable for other projects.
+- **Outcome:** The board was checked on Nov 4, and the user confirmed it works as before. CubeIDE's build was byte-for-byte the size of the command-line build (80,284 B flash, 30,720 B RAM).
+- **Lessons for future designs:**
+  - Instrumentation earns its keep during bring-up: every number in entries 34–46 came from it. Once the numbers are known, it costs more in reading time than it saves. Plan from the start for a branch or build that drops it.
+  - Most of the bulk was diagnosis of failures that are now understood (SD start tokens, CE# timing). Code written to find a fault should leave once the fault is found.
+  - Compare a rewrite against the original function by function before building. Behaviour can be lost silently in a rewrite that still compiles.
+
 ---
 
 ## Planned decisions (agreed, not built yet)

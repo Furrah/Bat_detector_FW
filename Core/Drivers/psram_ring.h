@@ -34,8 +34,7 @@ typedef enum
 {
     PSRAM_RING_OK = 0,
     PSRAM_RING_ERR_PRIORITY,    /* the burst interrupt doesn't have priority 0 to itself */
-    PSRAM_RING_ERR_CONFIG       /* SPI1 DMA isn't on DMA2 Ch1/Ch2, or SPI1 isn't 8-bit at /4 with NSSP off
-                                 * and High-speed pins */
+    PSRAM_RING_ERR_CONFIG       /* SPI1 or its DMA isn't set up as the burst timing needs */
 } PsramRing_Status_t;
 
 typedef enum
@@ -52,9 +51,9 @@ typedef enum
 
 
 /*
- * Take over SPI1 for the ring. Call after the boot tests, which use the
- * polled driver in psram.c (it must not be used once the ring runs), and
- * before the ADC starts, so ring block 0 is the first audio block.
+ * Take over SPI1 for the ring. Call after PSRAM_Init (psram.c, which must
+ * not be used once the ring runs) and before the ADC starts, so ring block
+ * 0 is the first audio block.
  */
 PsramRing_Status_t PsramRing_Start(void);
 
@@ -97,20 +96,6 @@ PsramRing_ReadResult_t PsramRing_ReadBlock(uint32_t block, void *dest, volatile 
 /* From DMA2_Channel1_IRQHandler: a burst has finished */
 void PsramRing_IRQHandler(void);
 
-
-/* Health and timing counters (psram_ring.c describes each); the debug link
- * reports them. Write 1 to psramRingResetStats to restart the timings. */
-extern volatile uint32_t psramRingBlocks;
-extern volatile uint32_t psramRingMaxSelectNs;
-extern volatile uint32_t psramRingLateBlocks;
-extern volatile uint32_t psramRingFaults;
-extern volatile uint32_t psramRingReads;
-extern volatile uint32_t psramRingMinSelectNs;
-extern volatile uint32_t psramRingMaxEntryNs;
-extern volatile uint32_t psramRingMaxIsrNs;
-extern volatile uint32_t psramRingOverTcem;
-extern volatile uint32_t psramRingBursts;
-extern volatile uint32_t psramRingResetStats;
 
 
 #endif /* DRIVERS_PSRAM_RING_H_ */

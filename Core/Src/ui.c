@@ -72,8 +72,8 @@ static uint32_t frequency = 0;              /* the LO, Hz */
 static uint8_t  tuneMode = TUNE_MANUAL;
 static uint16_t knob = 0;                   /* the LO knob's last applied reading */
 
-/* Both buttons start as "held", so a press left over from a power-up test
- * (PLAYBACK: SD speed, RECORD: full PSRAM) has to be released before it counts */
+/* Both buttons start as "held", so a button held at power-up has to be
+ * released before it counts */
 static uint8_t  playbackButton = 1;
 static uint8_t  playbackDebounce = 0;
 static uint32_t playbackHeldTicks = 0;
@@ -356,7 +356,8 @@ void UI_Init(void)
     lastRowTick = HAL_GetTick();
     lastBatteryTick = HAL_GetTick();
 
-    Waterfall_SetLOFrequency(frequency);
+    Waterfall_DrawAxis();
+    UI_ShowLo();
 }
 
 

@@ -1,86 +1,59 @@
 /*
  * psram_ring.c
  *
- * PSRAM ring buffer engine; see psram_ring.h.
+ * The PSRAM ring; see psram_ring.h.
  *
- * Each burst is one CE# cycle, moved entirely by DMA:
+ * Each burst is one CE# cycle, moved entirely by DMA (DMA2 Ch2 sends, Ch1
+ * receives every byte clocked back):
  *   write  0x02 + 24-bit address + 16 data bytes             20 bytes, 3.8 us at 42.5 MHz
  *   read   0x0B + 24-bit address + 1 wait byte + 16 bytes    21 bytes, 4.0 us
- * The TX channel feeds SPI1 from a staging buffer and the RX channel drains
- * every byte clocked in. RX transfer-complete marks the end of the burst:
- * the interrupt raises CE# first, then starts the next burst. CE# low time
- * is measured on every burst (psramRingMaxSelectNs).
+ * The receive channel finishing means the burst is over: its interrupt
+ * raises CE# first, then starts the next burst. CE# is low for at most
+ * ~4.5 us, against the PSRAM's 8 us limit (tCEM).
  *
- * On top of the wire time come ~0.5 us of DMA start, RX drain and interrupt
- * entry, and ~0.24 us in the interrupt up to CE# high (measured with 32-byte
- * bursts). It needs SPI1's NSS pulse mode off (see PsramRing_Start): with
- * it on, 32-byte bursts took 9.1 us.
+ * A block (512 bytes) is 32 write bursts, about 250 us of the 1.024 ms
+ * before the next block arrives. Writes go before reads.
  *
- * A block is 32 write bursts, copied from the ADC buffer half the DSP has
- * just been given. The ADC fills the other half meanwhile, so the writes
- * have one block period (1.024 ms) and need roughly 250 us. Writes go
- * before reads.
- *
- * The burst interrupt's code (marked __RAM_FUNC) runs from RAM. From flash
- * it cost ~4 us per burst: the DSP evicts it from the 1 KB instruction
- * cache between bursts, so it ran cold at 4 wait states every time.
+ * The burst interrupt runs ~31,000 times a second, so it runs from RAM
+ * (__RAM_FUNC) and this file builds at -O2: from flash it cost ~4 us a
+ * burst, from RAM about 2.3 us. Its helpers are forced inline: left to the
+ * compiler, an unrelated edit once made two of them calls (+45 cycles).
  */
-
 
 #include "psram_ring.h"
 
 #include <string.h>
 
 #include "main.h"
-#include "diag_cycles.h"
-#include "diag_spi.h"
 
-
-/*
- * This file builds at -O2 whatever the project setting (-Og in Debug). The
- * burst interrupt runs 32+ times per block; at -Og its helpers aren't
- * inlined, and it took 3.05 us per burst even from RAM. At -O2: 2.3 us.
- */
 #pragma GCC optimize ("O2")
-
 
 extern SPI_HandleTypeDef hspi1;
 extern DMA_HandleTypeDef hdma_spi1_rx;
 extern DMA_HandleTypeDef hdma_spi1_tx;
 
+/* 16 data bytes per burst: 32 took reads to 8.1 us, over tCEM */
+#define BURST                   16U
+#define BURSTS_PER_BLOCK        (PSRAM_RING_BLOCK_BYTES / BURST)
 
-/*
- * Data bytes per burst. 32 measured 7.5 us for writes, but reads (a byte
- * longer) reached 8.1 us when a masked section delayed the interrupt. 16
- * measures 4.44 us at most, reads included: 3.5 us clear of the 8 us tCEM,
- * at twice the interrupts.
- */
-#define PSRAM_RING_BURST            16U
-#define PSRAM_RING_BURSTS_PER_BLOCK (PSRAM_RING_BLOCK_BYTES / PSRAM_RING_BURST)
+#define WRITE_HEADER            4U          /* command + 24-bit address */
+#define READ_HEADER             5U          /* command + address + 8 wait cycles */
 
-#define PSRAM_RING_WRITE_HEADER     4U      /* command + 24-bit address */
-#define PSRAM_RING_READ_HEADER      5U      /* command + address + 8 wait cycles */
+#define CMD_WRITE               0x02U
+#define CMD_FAST_READ           0x0BU       /* plain read (0x03) is limited to 33 MHz */
 
-#define PSRAM_CMD_WRITE             0x02U
-#define PSRAM_CMD_FAST_READ         0x0BU   /* plain read 0x03 is limited to 33 MHz */
+#define RING_IRQn               DMA2_Channel1_IRQn
+#define LAST_IRQn               CORDIC_IRQn     /* the G431's last interrupt */
 
-#define PSRAM_PAGE_BYTES            1024U
+#define READ_QUEUE              16U         /* the recorder queues a whole 8-block chunk */
+#define READ_GUARD              64U         /* reads keep 64 blocks (65 ms) clear of the writer */
 
-/* The burst-complete interrupt, and the last interrupt number on the G431 */
-#define PSRAM_RING_IRQn             DMA2_Channel1_IRQn
-#define PSRAM_RING_LAST_IRQn        CORDIC_IRQn
+/* SCK/MISO/MOSI (PB3-5) must be at least High speed: the top bit of each OSPEEDR field */
+#define SPI1_PINS_FAST          ((1UL << 7) | (1UL << 9) | (1UL << 11))
 
-/* 16 so the SD writer can queue a whole multi-sector chunk while the last
- * one is written (recorder.c). 12 bytes each. */
-#define PSRAM_RING_READ_QUEUE       16U
-
-/* Reads keep this many blocks (65 ms) clear of the writer, so it can't lap them */
-#define PSRAM_RING_READ_GUARD       64U
-
-_Static_assert((PSRAM_RING_BLOCK_BYTES % PSRAM_RING_BURST) == 0U, "bursts must tile a block");
-_Static_assert((PSRAM_PAGE_BYTES % PSRAM_RING_BURST) == 0U, "a burst must not cross a 1 KB PSRAM page");
+_Static_assert((PSRAM_RING_BLOCK_BYTES % BURST) == 0U, "bursts must tile a block");
+_Static_assert((1024U % BURST) == 0U, "a burst must not cross a 1 KB PSRAM page");
 _Static_assert((PSRAM_SIZE_BYTES % PSRAM_RING_BLOCK_BYTES) == 0U, "blocks must tile the PSRAM");
-
 
 typedef enum
 {
@@ -95,39 +68,20 @@ typedef struct
     volatile uint8_t *done;
 } ReadRequest_t;
 
-
-/* Debug view: watch these in Live Expressions */
-volatile uint32_t psramRingBlocks = 0;          /* blocks completely written */
-volatile uint32_t psramRingMaxSelectNs = 0;     /* longest CE# low time; must stay below 8000 */
-volatile uint32_t psramRingLateBlocks = 0;      /* blocks still being written when the next arrived */
-volatile uint32_t psramRingFaults = 0;          /* failed or stuck bursts, recovered */
-volatile uint32_t psramRingReads = 0;           /* blocks read back */
-
-/*
- * Timing diagnostics. CE# low splits into "entry" (CE# low until the
- * interrupt starts: the transfer plus interrupt latency) and the time inside
- * the interrupt up to CE# high. Write 1 to psramRingResetStats to start over.
- */
-volatile uint32_t psramRingMinSelectNs = 0;     /* shortest CE# low time */
-volatile uint32_t psramRingMaxEntryNs = 0;      /* worst CE# low to interrupt start */
-volatile uint32_t psramRingMaxIsrNs = 0;        /* worst time inside the interrupt: CPU cost per burst */
-volatile uint32_t psramRingOverTcem = 0;        /* bursts with CE# low longer than tCEM */
-volatile uint32_t psramRingBursts = 0;          /* bursts timed */
-volatile uint32_t psramRingResetStats = 0;
-
 static volatile uint8_t  running = 0;
 static volatile uint8_t  paused = 0;            /* not recording; reads still run */
 static volatile uint8_t  busy = 0;              /* a burst is in flight */
-static volatile uint32_t pushedBlocks = 0;
-static volatile uint32_t resumeBlock = 0;       /* first block recorded since the last pause ended */
-static volatile uint32_t blockTicks = 0;        /* PushBlock calls, paused or not: the stuck-burst clock */
+static volatile uint32_t pushedBlocks = 0;      /* blocks handed over by the ADC */
+static volatile uint32_t writtenBlocks = 0;     /* blocks completely written */
+static volatile uint32_t resumeBlock = 0;       /* first block recorded since the last pause */
+static volatile uint32_t blockTicks = 0;        /* PushBlock calls: the stuck-burst clock */
 
-/* The block being written. writeSource is NULL when there's none. */
+/* The block being written; writeSource is NULL when there's none */
 static const uint8_t * volatile writeSource = NULL;
 static uint32_t writeBlock;
 static uint32_t writeBurst;
 
-static ReadRequest_t readQueue[PSRAM_RING_READ_QUEUE];
+static ReadRequest_t readQueue[READ_QUEUE];
 static volatile uint32_t readHead = 0;
 static volatile uint32_t readCount = 0;
 static uint32_t readBurst = 0;
@@ -135,18 +89,11 @@ static uint32_t readBurst = 0;
 /* The burst in flight */
 static BurstKind_t burstKind;
 static uint32_t burstBlock;
-static uint32_t burstStart;                     /* DWT cycle count at CE# low */
 static uint32_t burstStartedAt;                 /* blockTicks when it started */
 
-static uint32_t maxSelectCycles = 0;
-static uint32_t minSelectCycles = UINT32_MAX;
-static uint32_t maxEntryCycles = 0;
-static uint32_t maxIsrCycles = 0;
-static uint32_t tcemCycles;
-
-static uint8_t txWrite[PSRAM_RING_WRITE_HEADER + PSRAM_RING_BURST];
-static uint8_t txRead[PSRAM_RING_READ_HEADER + PSRAM_RING_BURST];      /* zeros after the header */
-static uint8_t rxBuffer[PSRAM_RING_READ_HEADER + PSRAM_RING_BURST];
+static uint8_t txWrite[WRITE_HEADER + BURST];
+static uint8_t txRead[READ_HEADER + BURST];     /* zeros after the header */
+static uint8_t rxBuffer[READ_HEADER + BURST];
 
 static DMA_Channel_TypeDef *rxChannel;
 static DMA_Channel_TypeDef *txChannel;
@@ -155,67 +102,11 @@ static DMA_TypeDef *txDma;
 static uint32_t rxFlagShift;
 static uint32_t txFlagShift;
 
-/* SPI1 settings to restore after a fault resets it */
+/* SPI1 settings, to restore after a fault resets it */
 static uint32_t spiCr1;
 static uint32_t spiCr2;
 
 
-
-/* Restart the timings (debug link 'Z'). Called at the end of the interrupt,
- * after its own time is taken, so this work never counts as a worst case. */
-__STATIC_FORCEINLINE void PsramRing_ResetTiming(void)
-{
-    maxSelectCycles = 0U;
-    minSelectCycles = UINT32_MAX;
-    maxEntryCycles = 0U;
-    maxIsrCycles = 0U;
-    psramRingMaxSelectNs = 0U;
-    psramRingMinSelectNs = 0U;
-    psramRingMaxEntryNs = 0U;
-    psramRingMaxIsrNs = 0U;
-    psramRingOverTcem = 0U;
-    psramRingBursts = 0U;
-    psramRingResetStats = 0U;
-}
-
-
-/* Called from the interrupt once CE# is high, so none of this counts against
- * tCEM. Forced inline, like the helpers below. */
-__STATIC_FORCEINLINE void PsramRing_RecordTiming(uint32_t selectCycles, uint32_t entryCycles)
-{
-    psramRingBursts++;
-
-    if(selectCycles > tcemCycles)
-    {
-        psramRingOverTcem++;
-    }
-
-    if(selectCycles > maxSelectCycles)
-    {
-        maxSelectCycles = selectCycles;
-        psramRingMaxSelectNs = Diag_CyclesToNs(selectCycles);
-    }
-
-    if(selectCycles < minSelectCycles)
-    {
-        minSelectCycles = selectCycles;
-        psramRingMinSelectNs = Diag_CyclesToNs(selectCycles);
-    }
-
-    if(entryCycles > maxEntryCycles)
-    {
-        maxEntryCycles = entryCycles;
-        psramRingMaxEntryNs = Diag_CyclesToNs(entryCycles);
-    }
-}
-
-
-/*
- * The small helpers of the burst interrupt are forced inline. Left to the
- * compiler, an unrelated change of size elsewhere in this file once turned
- * these two into calls from PsramRing_StartBurst: about 45 cycles more
- * per burst, from RAM (clean-up, Nov 3).
- */
 __STATIC_FORCEINLINE uint32_t PsramRing_BlockAddress(uint32_t block)
 {
     return (block % PSRAM_RING_BLOCKS) * PSRAM_RING_BLOCK_BYTES;
@@ -252,10 +143,10 @@ static __RAM_FUNC void PsramRing_StartBurst(void)
 
     if(writeSource != NULL)
     {
-        const uint32_t offset = writeBurst * PSRAM_RING_BURST;
+        const uint32_t offset = writeBurst * BURST;
 
-        PsramRing_PutHeader(txWrite, PSRAM_CMD_WRITE, PsramRing_BlockAddress(writeBlock) + offset);
-        memcpy(&txWrite[PSRAM_RING_WRITE_HEADER], writeSource + offset, PSRAM_RING_BURST);
+        PsramRing_PutHeader(txWrite, CMD_WRITE, PsramRing_BlockAddress(writeBlock) + offset);
+        memcpy(&txWrite[WRITE_HEADER], writeSource + offset, BURST);
 
         tx = txWrite;
         length = sizeof(txWrite);
@@ -267,8 +158,7 @@ static __RAM_FUNC void PsramRing_StartBurst(void)
         const ReadRequest_t *request = &readQueue[readHead];
 
         /* txRead[4] stays 0: the 8 wait cycles */
-        PsramRing_PutHeader(txRead, PSRAM_CMD_FAST_READ,
-                PsramRing_BlockAddress(request->block) + (readBurst * PSRAM_RING_BURST));
+        PsramRing_PutHeader(txRead, CMD_FAST_READ, PsramRing_BlockAddress(request->block) + (readBurst * BURST));
 
         tx = txRead;
         length = sizeof(txRead);
@@ -291,10 +181,8 @@ static __RAM_FUNC void PsramRing_StartBurst(void)
     txChannel->CMAR = (uint32_t)tx;
     txChannel->CNDTR = length;
 
-    SPI1_PSRAM_CS_GPIO_Port->BRR = SPI1_PSRAM_CS_Pin;
-    burstStart = Diag_Cycles();
-
-    txChannel->CCR |= DMA_CCR_EN;       /* the burst starts here */
+    SPI1_PSRAM_CS_GPIO_Port->BRR = SPI1_PSRAM_CS_Pin;   /* CE# low */
+    txChannel->CCR |= DMA_CCR_EN;                       /* the burst starts here */
 }
 
 
@@ -320,31 +208,29 @@ static void PsramRing_Fault(void)
     while(readCount > 0U)
     {
         *readQueue[readHead].done = PSRAM_RING_FAILED;
-        readHead = (readHead + 1U) % PSRAM_RING_READ_QUEUE;
+        readHead = (readHead + 1U) % READ_QUEUE;
         readCount--;
     }
 
     readBurst = 0U;
     busy = 0U;
-    psramRingFaults++;
 }
-
 
 
 PsramRing_Status_t PsramRing_Start(void)
 {
     SPI_TypeDef *spi = hspi1.Instance;
 
-    /* The burst timing above assumes 8-bit frames at 42.5 MHz (/4), and the
-     * interrupt handled is DMA2 Channel 1's. NSS pulse mode (NSSP, CubeMX's
-     * default) idles SCK for 2 clocks after every byte to pulse the NSS pin,
-     * even with software NSS: 9.1 us bursts, over tCEM. SCK/MISO/MOSI (PB3-5)
-     * must be High speed: on Low the SPI hung at 42.5 MHz. */
+    /* What the burst timing depends on, each a CubeMX setting that was once
+     * wrong: DMA on DMA2 Ch1/Ch2, 42.5 MHz (/4), 8-bit frames with an 8-bit
+     * receive threshold, NSS pulse mode off (it adds 2 clocks a byte and
+     * pushed bursts past tCEM), and fast pins (on Low speed the SPI hung). */
     if((hdma_spi1_rx.Instance != DMA2_Channel1) || (hdma_spi1_tx.Instance != DMA2_Channel2)
             || ((spi->CR1 & SPI_CR1_BR) != SPI_BAUDRATEPRESCALER_4)
+            || ((spi->CR2 & SPI_CR2_DS) != SPI_DATASIZE_8BIT)
             || ((spi->CR2 & SPI_CR2_FRXTH) == 0U)
-            || (Diag_SpiCheck(spi) != 0U)
-            || (Diag_GpioSlowPins(GPIOB, GPIO_PIN_3 | GPIO_PIN_4 | GPIO_PIN_5, GPIO_SPEED_FREQ_HIGH) != 0U))
+            || ((spi->CR2 & SPI_CR2_NSSP) != 0U)
+            || ((GPIOB->OSPEEDR & SPI1_PINS_FAST) != SPI1_PINS_FAST))
     {
         return PSRAM_RING_ERR_CONFIG;
     }
@@ -352,13 +238,20 @@ PsramRing_Status_t PsramRing_Start(void)
     /* The TX channel never interrupts; CubeMX enables its vector anyway */
     HAL_NVIC_DisableIRQ(DMA2_Channel2_IRQn);
 
-    /* The burst interrupt must be able to preempt everything else */
-    if(!Diag_IrqAloneAtTop(PSRAM_RING_IRQn, PSRAM_RING_LAST_IRQn))
+    /* The burst interrupt must be alone at priority 0, so nothing can delay it */
+    if(NVIC_GetPriority(RING_IRQn) != 0U)
     {
         return PSRAM_RING_ERR_PRIORITY;
     }
 
-    tcemCycles = (PSRAM_TCEM_NS * (SystemCoreClock / 1000000U)) / 1000U;
+    for(int32_t irq = 0; irq <= (int32_t)LAST_IRQn; irq++)
+    {
+        if((irq != (int32_t)RING_IRQn) && (NVIC_GetEnableIRQ((IRQn_Type)irq) != 0U)
+                && (NVIC_GetPriority((IRQn_Type)irq) == 0U))
+        {
+            return PSRAM_RING_ERR_PRIORITY;
+        }
+    }
 
     rxChannel = hdma_spi1_rx.Instance;
     txChannel = hdma_spi1_tx.Instance;
@@ -376,8 +269,11 @@ PsramRing_Status_t PsramRing_Start(void)
 
     memset(txRead, 0, sizeof(txRead));
 
-    /* drain anything the polled driver left, then hand the SPI to the DMA */
-    (void)Diag_SpiDrainRx(spi);
+    /* drain anything the boot-time driver left, then hand the SPI to the DMA */
+    while((spi->SR & SPI_SR_FRLVL) != 0U)
+    {
+        (void)*(__IO uint8_t *)&spi->DR;
+    }
 
     SET_BIT(spi->CR2, SPI_CR2_RXDMAEN | SPI_CR2_TXDMAEN);
     SET_BIT(spi->CR1, SPI_CR1_SPE);
@@ -399,8 +295,7 @@ uint8_t PsramRing_IsRunning(void)
 
 void PsramRing_SetPaused(uint8_t pause)
 {
-    /* pushedBlocks doesn't move while paused, so this is the next block to
-     * be recorded; set before recording restarts */
+    /* pushedBlocks doesn't move while paused, so it's the next block to be recorded */
     if(paused && !pause)
     {
         resumeBlock = pushedBlocks;
@@ -430,23 +325,21 @@ uint32_t PsramRing_GetPushedBlocks(void)
 
 uint32_t PsramRing_GetWrittenBlocks(void)
 {
-    return psramRingBlocks;
+    return writtenBlocks;
 }
 
 
 void PsramRing_PushBlock(const uint16_t *block)
 {
-    uint32_t primask;
-
     if(!running)
     {
         return;
     }
 
-    primask = __get_PRIMASK();
+    const uint32_t primask = __get_PRIMASK();
     __disable_irq();
 
-    /* A burst takes ~5 us; one started before the previous block arrived is
+    /* A burst takes ~5 us: one started before the last block arrived is
      * stuck. Checked while paused too, so a stuck read is still recovered. */
     if(busy && (burstStartedAt != blockTicks))
     {
@@ -457,11 +350,7 @@ void PsramRing_PushBlock(const uint16_t *block)
 
     if(!paused)
     {
-        if(writeSource != NULL)
-        {
-            psramRingLateBlocks++;      /* the rest of the previous block is lost */
-        }
-
+        /* if the last block isn't finished, its rest is lost: the new one takes over */
         writeSource = (const uint8_t *)block;
         writeBlock = pushedBlocks;
         writeBurst = 0U;
@@ -480,30 +369,28 @@ void PsramRing_PushBlock(const uint16_t *block)
 PsramRing_ReadResult_t PsramRing_ReadBlock(uint32_t block, void *dest, volatile uint8_t *done)
 {
     PsramRing_ReadResult_t result;
-    uint32_t primask;
-    uint32_t written;
 
     if(!running)
     {
         return PSRAM_RING_READ_INVALID;
     }
 
-    primask = __get_PRIMASK();
+    const uint32_t primask = __get_PRIMASK();
     __disable_irq();
 
-    written = psramRingBlocks;
+    const uint32_t written = writtenBlocks;
 
-    if((block >= written) || ((written - block) > (PSRAM_RING_BLOCKS - PSRAM_RING_READ_GUARD)))
+    if((block >= written) || ((written - block) > (PSRAM_RING_BLOCKS - READ_GUARD)))
     {
         result = PSRAM_RING_READ_INVALID;
     }
-    else if(readCount == PSRAM_RING_READ_QUEUE)
+    else if(readCount == READ_QUEUE)
     {
         result = PSRAM_RING_READ_BUSY;
     }
     else
     {
-        ReadRequest_t *request = &readQueue[(readHead + readCount) % PSRAM_RING_READ_QUEUE];
+        ReadRequest_t *request = &readQueue[(readHead + readCount) % READ_QUEUE];
 
         request->block = block;
         request->dest = dest;
@@ -527,10 +414,7 @@ PsramRing_ReadResult_t PsramRing_ReadBlock(uint32_t block, void *dest, volatile 
 
 __RAM_FUNC void PsramRing_IRQHandler(void)
 {
-    const uint32_t entry = Diag_Cycles();
     const uint32_t flags = rxDma->ISR >> rxFlagShift;
-    uint32_t cycles;
-    uint32_t isrCycles;
 
     if((flags & (DMA_ISR_TCIF1 | DMA_ISR_TEIF1)) == 0U)
     {
@@ -539,10 +423,7 @@ __RAM_FUNC void PsramRing_IRQHandler(void)
 
     /* end the CE# cycle before anything else */
     SPI1_PSRAM_CS_GPIO_Port->BSRR = SPI1_PSRAM_CS_Pin;
-    cycles = Diag_CyclesSince(burstStart);
-
     PsramRing_StopDma();
-    PsramRing_RecordTiming(cycles, entry - burstStart);
 
     if((flags & DMA_ISR_TEIF1) != 0U)
     {
@@ -550,15 +431,15 @@ __RAM_FUNC void PsramRing_IRQHandler(void)
     }
     else if(burstKind == BURST_WRITE)
     {
-        /* unless a newer block has taken over (late), move on to the next burst */
+        /* unless a newer block has taken over, move on to the next burst */
         if((writeSource != NULL) && (burstBlock == writeBlock))
         {
             writeBurst++;
 
-            if(writeBurst == PSRAM_RING_BURSTS_PER_BLOCK)
+            if(writeBurst == BURSTS_PER_BLOCK)
             {
                 writeSource = NULL;
-                psramRingBlocks = writeBlock + 1U;
+                writtenBlocks = writeBlock + 1U;
             }
         }
     }
@@ -566,32 +447,17 @@ __RAM_FUNC void PsramRing_IRQHandler(void)
     {
         ReadRequest_t *request = &readQueue[readHead];
 
-        memcpy(request->dest + (readBurst * PSRAM_RING_BURST),
-                &rxBuffer[PSRAM_RING_READ_HEADER], PSRAM_RING_BURST);
+        memcpy(request->dest + (readBurst * BURST), &rxBuffer[READ_HEADER], BURST);
         readBurst++;
 
-        if(readBurst == PSRAM_RING_BURSTS_PER_BLOCK)
+        if(readBurst == BURSTS_PER_BLOCK)
         {
             *request->done = PSRAM_RING_DONE;
-            psramRingReads++;
             readBurst = 0U;
-            readHead = (readHead + 1U) % PSRAM_RING_READ_QUEUE;
+            readHead = (readHead + 1U) % READ_QUEUE;
             readCount--;
         }
     }
 
     PsramRing_StartBurst();
-
-    isrCycles = Diag_CyclesSince(entry);
-
-    if(isrCycles > maxIsrCycles)
-    {
-        maxIsrCycles = isrCycles;
-        psramRingMaxIsrNs = Diag_CyclesToNs(isrCycles);
-    }
-
-    if(psramRingResetStats != 0U)
-    {
-        PsramRing_ResetTiming();
-    }
 }

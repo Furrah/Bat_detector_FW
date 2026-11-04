@@ -45,10 +45,6 @@
 #define FLOOR_LEARN_ROWS        25U
 
 
-volatile uint32_t autoTuneCalls = 0;
-volatile uint32_t autoTuneRetunes = 0;
-volatile uint32_t autoTuneLastHz = 0;
-
 static int8_t   floorSteps[WF_SCREEN_W];
 static uint32_t rows = 0;                   /* rows with FFT frames in them */
 static uint16_t colMin = 0;                 /* the search band, in columns */
@@ -278,9 +274,6 @@ uint8_t AutoTune_AddRow(const float *rowDb, uint16_t frames, uint32_t *loHz)
         return 0U;
     }
 
-    autoTuneCalls++;
-    autoTuneLastHz = (uint32_t)hz;
-
     calls[callNext] = (uint16_t)((hz + 5.0f) / 10.0f);
     callNext = (uint8_t)((callNext + 1U) % AUTOTUNE_CALLS);
     if(callCount < AUTOTUNE_CALLS)
@@ -312,7 +305,6 @@ uint8_t AutoTune_AddRow(const float *rowDb, uint16_t frames, uint32_t *loHz)
 
     tunedLoHz = target;
     rowsSinceRetune = 0U;
-    autoTuneRetunes++;
     *loHz = target;
     return 1U;
 }

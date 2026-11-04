@@ -6,9 +6,10 @@
   ******************************************************************************
   * Bat detector, V2 board. Start-up order: the CubeMX peripheral init, then
   * the audio modules, the display and the power-up checks (boot_checks.c),
-  * then the audio chain (TIM2 -> ADC1 -> DSP -> DAC). The main loop polls the
-  * front panel (ui.c), the USB debug link, the recorder and the FFT; the
-  * audio itself runs in the ADC's DMA interrupt (adc.c -> dsp.c).
+  * then the audio chain (TIM2 triggers ADC1 and the DAC; dsp.c in between).
+  * The main loop polls the front panel (ui.c), the recorder, the FFT and the
+  * display; the audio itself runs in the ADC's DMA interrupt (adc.c -> dsp.c).
+  * Docs/HOW_IT_WORKS.md explains the whole design.
   *
   * Copyright (c) 2026 STMicroelectronics.
   * All rights reserved.
@@ -34,7 +35,6 @@
 #include "bat_detect.h"
 #include "boot_checks.h"
 #include "dac.h"
-#include "debug_link.h"
 #include "dsp.h"
 #include "fft.h"
 #include "ili9341.h"
@@ -126,13 +126,6 @@ int main(void)
 
   /* USER CODE BEGIN SysInit */
 
-  /* CubeMX writes HSI48CalibrationValue = 32, but the G4's CRS TRIM is 7 bits
-   * with 64 as the middle; 32 would start HSI48 ~4-5% slow. TRIM is read-only
-   * while auto-trim runs, so pause it to write the value. */
-  CLEAR_BIT(CRS->CR, CRS_CR_AUTOTRIMEN);
-  MODIFY_REG(CRS->CR, CRS_CR_TRIM, RCC_CRS_HSI48CALIBRATION_DEFAULT << CRS_CR_TRIM_Pos);
-  SET_BIT(CRS->CR, CRS_CR_AUTOTRIMEN);
-
   /* USER CODE END SysInit */
 
   /* Initialize all configured peripherals */
@@ -160,7 +153,6 @@ int main(void)
   AutoTune_Init();
   DAC_Init();
   FFT_Init();
-  DebugLink_Init();
 
   // MX_GPIO_Init leaves every SPI chip-select low. Deselect SD and PSRAM
   // before the first SPI2 transfer so the SD card doesn't see display traffic.
@@ -172,10 +164,9 @@ int main(void)
   HAL_GPIO_WritePin(DISPLAY_LED_GPIO_Port, DISPLAY_LED_Pin, GPIO_PIN_SET); // backlight on
   ILI9341_FillScreen(ILI9341_BLACK);
 
-  // Power-up checks (boot_checks.h). Hold RECORD for the full 8 MB PSRAM
-  // test, PLAYBACK for the SD speed test. A PSRAM that passes starts its
-  // ring, which keeps the last 16.8 s of raw audio, before the ADC starts,
-  // so ring block 0 is the first block.
+  // Power-up checks (boot_checks.h). A PSRAM that answers starts its ring,
+  // which keeps the last 16.8 s of raw audio, before the ADC starts, so
+  // ring block 0 is the first block.
   BootChecks_Spi2();
   (void)BootChecks_Psram();
   BootChecks_Sd();
@@ -183,13 +174,14 @@ int main(void)
   Waterfall_Init();       // clears the check results off the screen
   Waterfall_SetRange(-10.0f, 20.0f);
 
-  ADC_SetHalfBufferCallback(DSP_ProcessBlock);
-  ADC_SetFullBufferCallback(DSP_ProcessBlock);
+  ADC_SetBlockCallback(DSP_ProcessBlock);    // every 256 samples, in the ADC DMA interrupt
   DSP_SetOutputCallback(DAC_WriteBlock);
 
-  HAL_TIM_Base_Start(&htim2);
+  // DAC and ADC armed first, then the timer that triggers both at 250 kHz,
+  // so neither misses the first trigger
   DAC_Start();
   ADC_Start();
+  HAL_TIM_Base_Start(&htim2);
 
   // TS4990 is held in standby by R9 until AMP_EN goes high. Enable it only
   // once the DAC is already outputting mid-scale, to avoid a turn-on pop.
@@ -205,7 +197,6 @@ int main(void)
   while (1)
   {
     UI_Poll();          // every 10 ms: knobs, buttons, header line, LEDs
-    DebugLink_Poll();   // USB debug capture: PC commands, data that's ready
     Recorder_Poll();    // WAV recording, ahead of the FFT: the PSRAM ring holds only 16.8 s
     FFT_Process();
     UI_PollDisplay();   // the waterfall's rows (and auto-tune), the battery readout

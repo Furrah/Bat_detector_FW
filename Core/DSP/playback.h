@@ -50,8 +50,5 @@ uint32_t Playback_GetRemainingMs(void);
 void Playback_Render(uint16_t *output, uint32_t length, float gain);
 
 
-/* Debug view: blocks not read from the PSRAM in time, played as silence (should stay 0) */
-extern volatile uint32_t playbackUnderruns;
-
 
 #endif /* DSP_PLAYBACK_H_ */

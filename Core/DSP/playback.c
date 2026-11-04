@@ -47,8 +47,6 @@
 _Static_assert(PLAYBACK_BLOCKS <= (PSRAM_RING_BLOCKS / 2U), "playback must fit well inside the ring");
 
 
-volatile uint32_t playbackUnderruns = 0;
-
 static volatile uint8_t active = 0;
 static uint8_t primed;                      /* the first two samples are loaded */
 
@@ -86,7 +84,7 @@ static void Playback_RequestBlocks(uint32_t fetchIndex)
 
         if(result == PSRAM_RING_READ_BUSY)
         {
-            return;     /* queue full (e.g. the debug link reading): try next block period */
+            return;     /* queue full (e.g. the recorder reading): try next block period */
         }
 
         if(result == PSRAM_RING_READ_INVALID)
@@ -109,11 +107,6 @@ static float Playback_Fetch(uint32_t index)
 
     if((slotBlock[slot] != block) || (slotDone[slot] != PSRAM_RING_DONE))
     {
-        if(offset == 0U)
-        {
-            playbackUnderruns++;
-        }
-
         return 0.0f;
     }
 
@@ -248,7 +241,7 @@ void Playback_Render(uint16_t *output, uint32_t length, float gain)
         const float weight = (float)fraction * (1.0f / 4294967296.0f);
         const float value = current + ((next - current) * weight);
 
-        output[i] = (uint16_t)DSP_clamp_output((int32_t)(value * scale));
+        output[i] = (uint16_t)DSP_ClampOutput((int32_t)(value * scale));
         i++;
 
         fraction += PLAYBACK_STEP;

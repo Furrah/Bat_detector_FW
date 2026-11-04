@@ -17,7 +17,7 @@
  *     0 Hz. It only moves for a change of more than 2 kHz, at most once a
  *     second, and holds between passes.
  *
- * It learns in both tuning modes; main.c applies its result only in auto.
+ * It learns in both tuning modes; ui.c applies its result only in auto.
  * Diary entry 45.
  */
 
@@ -43,10 +43,5 @@ uint8_t AutoTune_AddRow(const float *rowDb, uint16_t frames, uint32_t *loHz);
 /* Entering auto mode: compare against this LO from now on, and allow a
  * retune straight away. Calls already heard in this pass still count. */
 void AutoTune_Restart(uint32_t currentLoHz);
-
-/* Debug view (capture.py stats) */
-extern volatile uint32_t autoTuneCalls;     /* calls measured */
-extern volatile uint32_t autoTuneRetunes;   /* LO moves asked for */
-extern volatile uint32_t autoTuneLastHz;    /* the last call's loudest frequency */
 
 #endif /* DSP_AUTOTUNE_H_ */
