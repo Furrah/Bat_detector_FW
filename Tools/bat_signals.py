@@ -205,6 +205,36 @@ class Signal:
         t = np.arange(self.x.size - start) / SAMPLE_RATE_HZ
         self.x[start:] += self.level(level_db) * np.sin(2 * np.pi * freq_khz * 1e3 * t)
 
+    def add_burst(self, at_s, dur_ms, level_db, lo_khz=15.0, hi_khz=110.0, tilt_db_per_octave=0.0):
+        """
+        A burst of broadband noise, a stand-in for a finger or cloth rub (not
+        a call: it adds no truth). level_db is its rms over the band, re the
+        noise rms above 10 kHz. tilt < 0 puts more energy low down.
+        """
+        count = int(dur_ms * 1e-3 * SAMPLE_RATE_HZ)
+        spectrum = np.fft.rfft(self.rng.standard_normal(count))
+        f = np.fft.rfftfreq(count, 1.0 / SAMPLE_RATE_HZ) / 1e3
+        band = (f >= lo_khz) & (f <= hi_khz)
+        shape = np.where(band, (np.maximum(f, lo_khz) / lo_khz) ** (tilt_db_per_octave / 6.02), 0.0)
+        burst = np.fft.irfft(spectrum * shape, count)
+        burst *= self.level(level_db) / max(np.std(burst), 1e-12)
+        ramp = min(count // 4, int(2e-3 * SAMPLE_RATE_HZ))
+        if ramp > 0:
+            rise = 0.5 * (1 - np.cos(np.pi * np.arange(ramp) / ramp))
+            burst[:ramp] *= rise
+            burst[-ramp:] *= rise[::-1]
+        start = int(round(at_s * SAMPLE_RATE_HZ))
+        end = min(start + count, self.x.size)
+        self.x[start:end] += burst[:end - start]
+
+    def add_rubbing(self, first_s, last_s, level_db, **kw):
+        """Bursts of 5-60 ms at irregular 40-250 ms intervals, like rubbing fingers"""
+        at = first_s
+        while at < last_s:
+            dur = self.rng.uniform(5.0, 60.0)
+            self.add_burst(at, dur, level_db + self.rng.uniform(-6.0, 6.0), **kw)
+            at += (dur + self.rng.uniform(40.0, 250.0)) * 1e-3
+
     def codes(self):
         return np.clip(np.round(self.x + ADC_MIDSCALE + DC_OFFSET_CODES), 0, ADC_MAX).astype(np.uint16)
 
@@ -216,6 +246,12 @@ MYOTIS = [(0, 100), (3, 30)]
 HORSESHOE = [(0, 82), (50, 82)]
 NOCTULE_LOW = [(0, 30), (3, 22), (15, 20)]
 NOCTULE_HIGH = [(0, 34), (3, 26), (15, 24)]
+# Added for the species stages (European Bat Calls doc values)
+SOPRANO = [(0, 80), (2, 56), (6, 55)]
+LEISLER_LOW = [(0, 36), (2, 26), (9, 24.5)]
+LEISLER_HIGH = [(0, 39), (2, 29), (9, 27.5)]
+SEROTINE = [(0, 40), (4, 27), (11, 25)]
+NATTERER = [(0, 110), (1.5, 15)]        # the widest Myotis sweep: ~100 kHz in about 1 ms
 
 
 def bench_signals(noise, seed=1, level_db=20.0):
@@ -248,6 +284,34 @@ def bench_signals(noise, seed=1, level_db=20.0):
     signals.append(s)
 
     s = Signal("noise", 60.0, noise, rng, "noise only, for false calls per minute")
+    signals.append(s)
+
+    # Added for the species stages
+    s = Signal("soprano55", 3.0, noise, rng, "80 -> 56 kHz in 2 ms, 56 -> 55 kHz in 4 ms, every 80 ms (soprano pipistrelle)")
+    s.add_sequence(0.7, 2.9, 80, [SOPRANO], level_db)
+    signals.append(s)
+
+    s = Signal("leisler", 4.0, noise, rng, "9 ms QCF calls, tails alternating 24.5 / 27.5 kHz, every 200 ms (Leisler's)")
+    s.add_sequence(0.7, 3.9, 200, [LEISLER_LOW, LEISLER_HIGH], level_db)
+    signals.append(s)
+
+    s = Signal("serotine", 4.0, noise, rng, "11 ms calls ending at 25 kHz, every 150-250 ms, no alternation (serotine)")
+    at = 0.7
+    while at < 3.9:
+        s.add_call(at, SEROTINE, level_db)
+        at += rng.uniform(0.15, 0.25)
+    signals.append(s)
+
+    s = Signal("natterer", 3.0, noise, rng, "110 -> 15 kHz in 1.5 ms every 80 ms (Natterer's: the widest sweep)")
+    s.add_sequence(0.7, 2.9, 80, [NATTERER], level_db)
+    signals.append(s)
+
+    s = Signal("rub-flat", 6.0, noise, rng, "broadband bursts 15-110 kHz, 5-60 ms, irregular (a rub, flat spectrum)")
+    s.add_rubbing(0.7, 5.9, level_db + 5)
+    signals.append(s)
+
+    s = Signal("rub-tilt", 6.0, noise, rng, "the same, falling 6 dB per octave (a rub, more energy low down)")
+    s.add_rubbing(0.7, 5.9, level_db + 5, tilt_db_per_octave=-6.0)
     signals.append(s)
 
     return signals

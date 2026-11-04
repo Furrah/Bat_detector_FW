@@ -17,6 +17,7 @@
 #include "waterfall.h"
 #include "../DSP/autotune.h"
 #include "../DSP/bat_detect.h"
+#include "../DSP/classifier.h"
 #include "../DSP/dsp.h"
 #include "../DSP/fft.h"
 #include "../DSP/playback.h"
@@ -47,6 +48,9 @@
 
 /* How long a message ("PLAY: busy", "REC: SD full", ...) stays up */
 #define LABEL_MESSAGE_MS        2000U
+
+/* How long the classifier's verdict ("PIPPIP 87%  9") stays up after a pass */
+#define LABEL_VERDICT_MS        5000U
 
 /* What the header line shows, so it's only redrawn when that changes */
 #define LABEL_LO                0U
@@ -116,12 +120,17 @@ static void UI_SetLo(uint32_t hz)
     }
 }
 
-/* A message in the header line for LABEL_MESSAGE_MS (13 characters) */
+/* A message in the header line for ms (13 characters) */
+static void UI_ShowMessageFor(const char *text, uint32_t ms, uint16_t colour)
+{
+    ILI9341_WriteString(5, 5, text, Font_16x26, colour, ILI9341_BLACK);
+    headerLabel = LABEL_MESSAGE;
+    messageUntil = tick + ms;
+}
+
 static void UI_ShowMessage(const char *text)
 {
-    ILI9341_WriteString(5, 5, text, Font_16x26, ILI9341_WHITE, ILI9341_BLACK);
-    headerLabel = LABEL_MESSAGE;
-    messageUntil = tick + LABEL_MESSAGE_MS;
+    UI_ShowMessageFor(text, LABEL_MESSAGE_MS, ILI9341_WHITE);
 }
 
 
@@ -265,14 +274,20 @@ static void UI_RecordButton(void)
 
 
 /*
- * The header line: a message for 2 s, else the playback countdown
- * ("PLAY 10x  20s"), the recording time ("REC   1:23"), or "REC saving"
- * while the backlog is written out. The LO readout comes back when none of
- * them is up.
+ * The header line: a message for 2 s or the classifier's verdict for 5 s,
+ * else the playback countdown ("PLAY 10x  20s"), the recording time
+ * ("REC   1:23"), or "REC saving" while the backlog is written out. The LO
+ * readout comes back when none of them is up.
  */
 static void UI_UpdateHeader(void)
 {
     char text[32];
+
+    /* a bat pass has been named (the classifier stands aside while recording or playing) */
+    if(Classifier_TakeVerdict(text))
+    {
+        UI_ShowMessageFor(text, LABEL_VERDICT_MS, ILI9341_YELLOW);
+    }
 
     /* a recording that ended by itself (an error, or the time limit) says why */
     const Recorder_Status_t recordEnd = Recorder_TakeResult();

@@ -17,6 +17,7 @@ A MEMS microphone hears ultrasound from 20 to 120 kHz. The firmware does five jo
 | **Detector** | LED0 lights during a bat pass, LED1 flashes on each call | `bat_detect.c` |
 | **Auto-tune** | In auto mode, the heterodyne follows the bats' frequency | `autotune.c` |
 | **Memory** | The last 16.8 s of raw audio always kept in PSRAM, for **playback** 10× slower (time expansion) and **recording** to SD as WAV, starting 5 s before the press | `psram_ring.c`, `playback.c`, `recorder.c` |
+| **Species** | After a pass, the bat's species or group in the header line ("PIPPIP 87%  9"), and the verdict logged to `CALLS.CSV` | `classifier.c`, `call_log.c` |
 
 ```mermaid
 flowchart LR
@@ -51,7 +52,8 @@ flowchart TB
     end
     subgraph LOOP["Main loop: whatever time is left"]
         U["UI_Poll<br/>buttons, knobs, header, LEDs"] --> RP["Recorder_Poll<br/>ring to SD"]
-        RP --> F["FFT_Process<br/>1024-point FFT"]
+        RP --> CP["Classifier_Poll<br/>bat passes from the ring"]
+        CP --> F["FFT_Process<br/>1024-point FFT"]
         F --> UD["UI_PollDisplay<br/>waterfall row, auto-tune, battery"]
         UD --> U
     end
@@ -63,7 +65,7 @@ flowchart TB
 
 **The PSRAM burst interrupt** is the most urgent thing on the chip. The PSRAM must not have its chip-select (CE#) held low for more than 8 µs, or it misses its refresh and loses data. So every burst's end is handled at priority 0, ahead of everything else. That includes the audio.
 
-**The main loop** does everything slow or blocking: SD writes (up to 20 ms each), the FFT (about 2.3 ms), and display drawing over SPI. These can't go in an interrupt because they'd hold up the audio.
+**The main loop** does everything slow or blocking: SD writes (up to 20 ms each), the FFT (about 1.3 ms), the species classifier, and display drawing over SPI. These can't go in an interrupt because they'd hold up the audio.
 
 The two halves talk through small shared variables. The interrupt sets them and the main loop reads them, or the other way round: `fftMagnitudeReady`, the PSRAM ring's block counters, `BatDetect_IsBatPresent()`, and the volume and LO settings.
 
@@ -375,13 +377,13 @@ Known limit: rubbing fingers or cloth makes real broadband ultrasound, 40 dB abo
 ```mermaid
 flowchart LR
     BLK["audio blocks<br/>(interrupt)"] -->|"FFT_AddSamples<br/>4 blocks = 1024 samples"| BUF["FFT buffer<br/>(drops blocks while<br/>a frame waits)"]
-    BUF -->|"frame ready"| FP["FFT_Process<br/>(main loop, ~2.3 ms)"]
+    BUF -->|"frame ready"| FP["FFT_Process<br/>(main loop, ~1.3 ms)"]
     FP -->|"513 magnitudes<br/>fftMagnitudeReady"| ACC["Waterfall_Accumulate<br/>peak-hold per column"]
     ACC -->|"every 40 ms"| AT["AutoTune_AddRow"]
     AT --> FLUSH["Waterfall_FlushRow<br/>240 pixels, scroll"]
 ```
 
-**The FFT.** 1024 real samples are packed into a 512-point complex FFT: even samples as the real parts, odd as the imaginary. It's a radix-2 FFT with a Hann window. The two halves are then separated with the real-FFT identity, giving 513 bins of 244 Hz each, from 0 to 125 kHz. That's about half the work of a 1024-point complex FFT. The window, twiddle factors and unpack rotation are tables in flash. The bit reversal uses the M4's `RBIT` instruction. It takes about 2.3 ms per frame. The library version (CMSIS-DSP) needed a 4 KB buffer that doesn't fit.
+**The FFT.** 1024 real samples are packed into a 512-point complex FFT: even samples as the real parts, odd as the imaginary. It's a radix-2 FFT with a Hann window. The two halves are then separated with the real-FFT identity, giving 513 bins of 244 Hz each, from 0 to 125 kHz. That's about half the work of a 1024-point complex FFT. The window, twiddle factors and unpack rotation are tables in flash. The bit reversal uses the M4's `RBIT` instruction. It takes about 1.3 ms per frame (216k cycles at `-O2`, audio interrupts included). The library version (CMSIS-DSP) needed a 4 KB buffer that doesn't fit.
 
 The interrupt only copies samples in. The FFT itself runs in the main loop. If the main loop is busy (an SD write, say), frames are skipped, never half-overwritten.
 
@@ -422,7 +424,32 @@ It learns in both modes. In manual mode its answer is ignored, so switching to a
 
 ---
 
-## 11. The front panel (`ui.c`)
+## 11. The species classifier (`classifier.c`)
+
+After a bat pass it names the bat: "PIPPIP 87%  9" in the header line for 5 s, in yellow. That's the species or group code, the confidence and the number of calls. How it decides, and how well it does on real recordings, is in `Docs/CLASSIFIER_FINDINGS.md`; the design and its costs are in `Docs/CLASSIFIER_PLAN.md`.
+
+It doesn't listen live. It reads each pass back from the PSRAM ring in the main loop, a second or two behind, the way playback reads it:
+
+```mermaid
+flowchart LR
+    DET["detector:<br/>pass starts"] --> S["session from 2 s<br/>before the pass"]
+    S --> R["ring block<br/>(two slots)"]
+    R --> C["classifier_calls.c<br/>4 frames per block:<br/>calls and their features"]
+    C --> SP["classifier_species.c<br/>shape, species rules,<br/>vote over the last 10 calls"]
+    SP --> H["header line"]
+    SP --> L["CALLS.CSV<br/>(call_log.c)"]
+```
+
+- **A session** runs from 2 s before the detector's pass began until the pass is over (2 s after its last pulse) and the classifier has caught up with the ring. The first 0.52 s of it only learn the noise floor.
+- **It stands aside** while a recording is open or saving, and during playback. A pass that starts meanwhile is picked up afterwards, if it's still in the ring.
+- **It never reads audio about to be overwritten.** More than 12 s behind, or across a playback pause, it ends the session and starts again on newer audio. `classifierSkips` counts these.
+- **Each sequence** (calls less than 1 s apart, 3 or more of them) gets a verdict, shown in the header and written as one line to `CALLS.CSV` on the card: its ring position (in 64-sample hops), the number of calls, the code and the confidence. Detections it doesn't report aren't written.
+- **Faint-sweep verdicts** ("FAINT", "PLESP", "BARBAR": long-eared bats and barbastelle) are neither shown nor logged, because indoor noise and taps were named that way too easily. `CLASSIFIER_REPORT_FAINT` in `classifier.h` turns them back on. With `CALL_LOG_CALLS` set in `call_log.h`, every call is a line too, with its measurements, shape group and label (columns in `classifier_species.h`); that's for checking the board against the PC model, and it's off because it grows fast.
+- **The log** collects lines in a 512-byte buffer. When the buffer fills, and at the end of each pass, it mounts the card, appends to the file and closes it again, so nothing is left open when the recorder takes the card.
+
+`classifier_calls.c` and `classifier_species.c` use no HAL. They're a port of the PC model (`Tools/classify.py`, `Tools/species.py`), and `Tools/check_classifier_c.py` builds them on the PC with gcc and compares them call by call on the same audio. On 40 labelled recordings, all 17,519 calls agree within a frame and all 59 sequence verdicts are the same. `classifierBlockCyclesMax` (Live Expressions) is the most CPU one ring block has taken, against the 174,080 cycles of real time.
+
+## 12. The front panel (`ui.c`)
 
 | Control | Does |
 |---|---|
@@ -459,7 +486,7 @@ Both buttons start as "held" at power-up, so a button held while switching on ha
 
 It shows one thing at a time, in this order of priority:
 
-1. a message for 2 s ("REC: no card", "MODE: AUTO", ...);
+1. a message for 2 s ("REC: no card", "MODE: AUTO", ...), or the classifier's verdict for 5 s ("PIPPIP 87%  9", in yellow; never the faint-sweep group);
 2. "PLAY 10x  17s" during playback;
 3. "REC   1:23" while recording;
 4. "REC saving" while the backlog is written;
@@ -469,7 +496,7 @@ It's redrawn only when its content changes, because drawing text over SPI is slo
 
 ---
 
-## 12. Start-up
+## 13. Start-up
 
 ```mermaid
 flowchart TD
@@ -493,21 +520,22 @@ flowchart TD
 
 The ring starts before the ADC, so the first audio block is ring block 0. The amplifier is enabled last. Until then the 100k pull-down on `AMP_EN` holds it in standby, so there's no turn-on thump.
 
-## 13. The main loop
+## 14. The main loop
 
 ```mermaid
 flowchart TD
     A["UI_Poll<br/>(every 10 ms; returns at once otherwise)"] --> B["Recorder_Poll<br/>(up to 20 ms while recording)"]
-    B --> C["FFT_Process<br/>(if a frame is waiting, ~2.3 ms)"]
+    B --> CL["Classifier_Poll<br/>(during a pass: up to 4 ring blocks,<br/>and the call log's SD writes)"]
+    CL --> C["FFT_Process<br/>(if a frame is waiting, ~1.3 ms)"]
     C --> D["UI_PollDisplay<br/>(new FFT: accumulate,<br/>every 40 ms: auto-tune + row,<br/>every 1 s: battery)"]
     D --> A
 ```
 
-The recorder goes before the FFT on purpose. The ring only holds 16.8 s, so falling behind on the card loses audio. Falling behind on the FFT only skips a frame of the picture.
+The recorder goes before the FFT on purpose. The ring only holds 16.8 s, so falling behind on the card loses audio. Falling behind on the FFT only skips a frame of the picture. The classifier does nothing while a recording is open, so the two never compete; while it's busy with a pass, the waterfall gets fewer frames.
 
 ---
 
-## 14. Interrupts and priorities
+## 15. Interrupts and priorities
 
 Lower number = more urgent. A higher-priority interrupt can preempt a lower one.
 
@@ -525,7 +553,7 @@ The PSRAM interrupt must be alone at 0. `PsramRing_Start()` checks it, because C
 
 ---
 
-## 15. Memory
+## 16. Memory
 
 ### RAM (32 KB)
 
@@ -541,20 +569,23 @@ The PSRAM interrupt must be alone at 0. `PsramRing_Start()` checks it, because C
 | PSRAM ring interrupt code (runs from RAM) | ~1,000 | `psram_ring.c` |
 | Waterfall row (dB + pixels) | 1,440 | `waterfall.c` |
 | FatFS (volume and file objects) | ~600 | FatFS, `recorder.c` |
+| Classifier: frames, call track, vote | 2,686 | `classifier_calls.c`, `classifier_species.c` |
+| Classifier: ring slots (2 × 512 B) and state | 1,076 | `classifier.c` |
+| Call log buffer and file object | 573 | `call_log.c` |
 | DSP output block | 512 | `dsp.c` |
 | Heap reserve | 512 | linker script |
 | Everything else (HAL handles, state, tables) | ~2,300 | |
-| **Used** | **25,784 of 32,768 (6.8 KB free)** | |
+| **Used** | **29,360 of 32,768 (3.3 KB free)** | |
 
 No `malloc`, and no big buffers on the stack. Every buffer is a fixed static array, so the linker's map file shows exactly where the memory goes.
 
 ### Flash (128 KB)
 
-About 66 KB is used: the code plus the constant tables: the FFT window, twiddles, unpack rotation and NCO sine, generated into `Core/DSP/Tables/` by `Tools/gen_dsp_tables.py`. A static assert stops the build if a table doesn't match `AUDIO_FFT_LENGTH` or `LUT_SIZE`.
+About 80 KB is used: the code plus the constant tables: the FFT window, twiddles, unpack rotation and NCO sine, and the classifier's own smaller set, generated into `Core/DSP/Tables/` by `Tools/gen_dsp_tables.py`. A static assert stops the build if a table doesn't match `AUDIO_FFT_LENGTH`, `LUT_SIZE` or `CLS_FFT_LENGTH`. The classifier is about 15 KB of it, including its species rules.
 
 ---
 
-## 16. File map
+## 17. File map
 
 Reading order: `pipeline_config.h`, then `main.c` (USER CODE parts), `adc.c`, `dsp.c`, `dac.c`. That's the whole live-audio path. Then `ui.c`, and then whichever feature you're interested in.
 
@@ -575,6 +606,11 @@ Reading order: `pipeline_config.h`, then `main.c` (USER CODE parts), `adc.c`, `d
 | `Core/DSP/bat_detect.c` | The pulse-rhythm detector |
 | `Core/DSP/autotune.c` | Follow the bats with the LO |
 | `Core/DSP/playback.c` | Time-expansion playback from the ring |
+| `Core/DSP/classifier.c` | The species classifier: reads each bat pass back from the ring, shows the verdict |
+| `Core/DSP/classifier_calls.c` | Its stages 1-3: frames, calls, features (no HAL: also built on the PC) |
+| `Core/DSP/classifier_species.c` | Its stages 4-6: shape groups, species rules, the vote (no HAL) |
+| `Core/DSP/classifier_config.h` | Its constants, mirroring the PC model |
+| `Core/Src/call_log.c` | `CALLS.CSV`: a line per reported pass (and per call, if switched on) |
 | `Core/DSP/Tables/` | Generated constant tables (don't edit) |
 | `Core/Display/waterfall.c` | The scrolling spectrogram |
 | `Core/Display/ili9341.c`, `fonts.c` | Display driver (afiskon's, with hardware scroll added) |
@@ -582,5 +618,7 @@ Reading order: `pipeline_config.h`, then `main.c` (USER CODE parts), `adc.c`, `d
 | `FATFS/Target/user_diskio.c` | FatFS's glue to `sd_spi.c` |
 | `Tools/gen_dsp_tables.py` | Generates `Core/DSP/Tables/` |
 | `Tools/check_raw.py` | Checks a recording on the PC: header, and every sample a 12-bit code × 16 |
+| `Tools/classify.py`, `species.py` | The classifier's PC model, the reference the C follows |
+| `Tools/check_classifier_c.py` | The C classifier against the model: on the PC (gcc), or the board's `CALLS.CSV` against a WAV it recorded |
 | `Archive/` | Not built: the debug link, stats, `Diag` library, bench tests, PC capture tools, V1 parts |
 | `Docs/engineering_diary.md` | Why things are the way they are: every decision, with numbers |

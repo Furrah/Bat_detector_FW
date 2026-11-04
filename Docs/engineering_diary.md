@@ -985,6 +985,295 @@ Entries are in order, with the newest at the bottom. Decisions that are agreed b
   - Most of the bulk was diagnosis of failures that are now understood (SD start tokens, CE# timing). Code written to find a fault should leave once the fault is found.
   - Compare a rewrite against the original function by function before building. Behaviour can be lost silently in a rewrite that still compiles.
 
+## 2026-11-04: Species classifier, the plan
+
+### 48. Species classifier: reads each pass back from the PSRAM ring; European table; all six stages modelled on the PC (Nov 4)
+- **Decision:** Build the classifier of `Docs/Bat Species Classifier.md` as a **reader of the PSRAM ring in the main loop**, not as a live interrupt.
+  - The energy detector stays as the trigger. When it starts a pass, the classifier reads the pass back from 2 s before it began and runs the six stages a moment behind the live audio.
+  - The plan is `Docs/CLASSIFIER_PLAN.md`.
+  - The user's choices:
+    - the label goes in the header line, and a status line can come later;
+    - it waits while a recording is open;
+    - no auto-record;
+    - the European species table.
+  - Step 0, the PC model of all six stages, is built.
+- **Context:** Removing the debug code and USB left 6.8 KB of RAM free (entry 47). The user asked whether halving the data pipeline would make room for the classifier, at the cost of FFT resolution, and for a plan.
+- **Why (with numbers):**
+  - **Halving the pipeline isn't needed:**
+    - A 512-point waterfall FFT would give back 3,072 B of RAM and ~5 KB of flash, with little visible change: the display's columns are 521 Hz, about one 512-point bin.
+    - 128-sample blocks would give ~1.6 KB, but the recorder is built on "one block = one sector". Not worth it.
+    - The classifier needs about 4.5 KB (4,592 B: 1 KB of ring read slots, a 1.25 KB call track, 0.5 KB of FFT arrays, a 0.5 KB log buffer and small state). That leaves 2.3 KB spare.
+  - **Live doesn't fit:**
+    - Stage 1 at 3,906 frames/s, at 11–19k cycles a frame (the measured 1024-point FFT scaled by N log N), is 25–44% of the CPU.
+    - On top of the audio interrupt's 45% (63% while recording), that's 70–89% (88–107%).
+    - Read back from the ring, it has no deadline: the worst it can do is fall behind.
+  - **Waiting during recordings** (the user's choice) also means the recorder and the classifier never compete for the ring's read queue or the main loop.
+- **What the PC model found** (`Tools/species.py` is new; `Tools/classify.py` and `bat_signals.py` came back from the archive):
+  1. **Rubs fool the six stages as designed.** Two synthetic rubs gave about 8,000 false calls a minute, labelled *Myotis* sp. and long-eared. The rubs were bursts of broadband noise, 5–60 ms at irregular intervals, one flat and one falling 6 dB per octave.
+  2. **A peak-over-median "tonality" test doesn't separate them.** The weakest call frames read 14–15 dB, the rubs' median 13.6 dB. For a tonal frame the ratio is just its SNR, so weak calls sit with the rubs.
+  3. **The median bin on its own does.**
+     - Every frame of every bench call has its median bin within 2.1 dB of the mean noise. That includes a Natterer's sweep of 63 kHz/ms, about 30 kHz per frame.
+     - The rubs are at 14.6 dB or more.
+     - Four rules came out of it:
+       - a frame is broadband if more than half its bins are more than 6 dB up;
+       - it is also broadband if more than half its bins are within 10 dB of its peak (a rub's edges);
+       - a call is dropped if most of its frames have a median more than 3 dB up;
+       - a call rising more than 5 kHz doesn't vote.
+     - Each is a count over the 57 bins in C, about 300 cycles a frame for all of them.
+     - The rubs went from ~8,000 false calls a minute to nothing reported: one stray call in 5 s, no sequence. Sensitivity is unchanged: the pipistrelle is still found 20/20 at −5 dB re the noise.
+  4. **Sweep ends.** Stage 3 reads them about 0.25 ms inside the call (entry 43): the end of a 100 → 30 kHz sweep reads 35.4 kHz. The literature ranges describe the true end, so the *Myotis* rules use the ends extrapolated 0.25 ms along their own slope.
+  5. **Sloping tails.** The characteristic frequency is the flattest point of the last 40%. On a tail of constant slope that's ambiguous by the tail's change over that 40% (1.3 kHz for an 11 ms serotine-like call). The rules' 2 kHz soft margins absorb it.
+  6. **Europe-wide means range-only pairs become groups.** Island-only species (the Crete and Madeira pipistrelles) are behind a region setting, off by default. Their bands overlap the common pipistrelle's, and leaving them on would make every common pipistrelle "Pipistrelle group".
+- **Bench results** (13 signals at +20 dB re the board's noise; `--selftest` passes):
+  - greater horseshoe, common and soprano pipistrelle: named, 100%;
+  - noctule and Leisler's: named by alternation;
+  - a serotine-like call stays at the nyctaloid group, as the reference doc expects;
+  - a 100 → 30 kHz sweep stays at *Myotis* sp.;
+  - a 110 → 15 kHz sweep: the Natterer's complex;
+  - a pipistrelle under a 40 kHz tone 10 dB louder: named;
+  - echoes: 25/25 rejected;
+  - noise and both rubs: nothing reported.
+- **Alternatives considered:**
+  - **Live, in its own interrupt (the original design):** rejected, it doesn't fit while recording.
+  - **Halving the FFT or the blocks:** not needed. The 512-point FFT is kept in reserve as an easy 3 KB.
+  - **Peak-over-median tonality:** rejected, it overlaps (point 2).
+  - **The Pays de Gex table:** the user chose European.
+  - **Auto-record on a classified pass:** the user said no.
+- **Outcome:**
+  - The plan is agreed, and the PC model passes on synthetic signals. Nothing on the board has changed.
+  - Not yet tried:
+    - real rubs (the user's WAVs are on the old SD card);
+    - real bats (public recordings now, the device's own in spring).
+  - Still open: whether the per-call CSV log (text, ~100 B a call) is on by default.
+- **Lessons for future designs:**
+  - Test a detector against its likeliest false trigger before trusting it, synthesised if there's nothing real yet. Here it showed the designed stages had no defence at all.
+  - The statistic that separates two classes may be the background's (the median bin), not the foreground's (the peak). A ratio of the two inherits the foreground's spread, here the weak calls' low SNR.
+  - "The median is above X" is "more than half the values are above X": one count, no sort. Look for the counting form of an order statistic before porting it to a microcontroller.
+
+### 49. The classifier model on real recordings: Zenodo 3247097, rebuilt; five rule changes; a held-out test (Nov 4)
+- **Decision:**
+  - Score the PC model on real recordings: the Zenodo "Bat recordings split data set" (record 3247097, CC-BY 4.0, M. Bertran Ferrer). It holds common and soprano pipistrelles, 256 kHz.
+  - Five rule changes came out of it, each justified without fitting to this dataset.
+  - Fitting the one number the textbook rules get wrong, the common/soprano boundary, didn't help on held-out nights, so it isn't adopted.
+  - The new tool is `Tools/real_calls.py`.
+- **Context:** The user asked to test on real calls downloaded from the internet and resampled to 250 kHz. Then, mid-way: "focus on real data and ignore the bat detector": no board noise model.
+  - **xeno-canto** (now with bats, original files up to 192 kHz) timed out from this machine, site and API alike.
+  - **ChiroVox** releases recordings on request.
+  - **Zenodo** answered.
+- **How the test is built:**
+  - The dataset is cut into one WAV per call or gap (3–6 ms calls).
+  - Splicing the calls into the board's noise first gave several harness artefacts, each fixed in turn:
+    - each cut-out's own 10–20 kHz noise made fake 12 kHz calls;
+    - high-passing the cut-outs instead left a hole the noise floor fell into, faking calls for 0.5 s after each one;
+    - the splice clipped the board's 24.9 kHz line.
+  - **The method that stuck:** the cut-outs tile each 400 ms fragment (97–99% of it; a few ms are missing at the joins). So the original recordings rebuild sample for sample: 444 runs of 1.2 s or more, 1,002 s in all. The joins are cross-faded over 0.1 ms. Each run is preceded by its own first 0.6 s, so the noise floor can settle, and that copy is not scored.
+  - The 24.9 kHz line in the bench noise comes from the PC; the user reports it isn't there in the field.
+- **The rule changes** (`--selftest` still passes after each):
+  1. **A call narrower than 8 kHz is QCF.** It's a constant-frequency tail, even with less than 2 ms of it flat. 30% of the real pipistrelle calls were 1–3 ms tails without their sweep (clutter, or cut fragments), and they fell through to "faint FM". The reference doc's faint-FM calls sweep 8 kHz or more.
+  2. **Sweep-end extrapolation only on calls of 1.5 ms or more** (6 frames), clamped to the analysed band. Short calls gave ends of 1.8 kHz.
+  3. **No frequency rule for Schreiber's bat.** The reference doc's "frequency alone?" is No, and its 50–52 kHz band took 19% of the common and 10% of the soprano calls.
+  4. **Energy from below the band.** A call peaking in the lowest analysed bin (under 10.8 kHz) doesn't vote. Free-tailed bat and greater noctule rules need calls of 8 and 12 ms or more. On the real recordings, 5,188 "calls" (median 1.0 ms at 9.9 kHz, below-band energy leaking into the lowest bin) had been labelled free-tailed bat, 23% of all labels in the common pipistrelle recordings.
+  5. **The band-group fallback.** A QCF call that no species rule fits falls back to the group of its band (Pipistrelle group at 33–60 kHz, Nyctaloid at 17–31 kHz), not "Bat sp.".
+- **Results, all 444 rebuilt recordings (textbook ranges):**
+
+  | | Recordings | Named right | Wrong species | Group | Bat sp. / nothing |
+  |---|---|---|---|---|---|
+  | Common pipistrelle | 246 | 37% | 1% | 15% | 47% |
+  | Soprano pipistrelle | 198 | 10% | 12% | 32% | 46% |
+
+  - **Wrong species is rare for common pipistrelles.** The model mostly falls back to a group instead of guessing.
+- **The two species barely separate in this dataset:**
+  - **The figures:** median characteristic frequency per recording is 49.2 kHz common, 50.9 kHz soprano. The reference doc has about 47 and 56 kHz.
+  - **The shapes:** the common recordings cluster tightly at 48–50 kHz. Most "soprano" recordings sit at 50–52 kHz, and only about 32 of 179 are in the textbook 53–58 kHz.
+  - **Best single split, fitted in-sample:** 69% per call, 81% per recording.
+  - Either many soprano recordings are mislabelled or mixed, or the population is unusual. The dataset says neither where nor with what it was recorded.
+- **Held-out test** (`--validate`): fit the boundary on half the nights, score the other half. The split is by night, so the same bat isn't in both halves:
+  - half A: Jun 7, Jun 9, Aug 20, Sep 20 (71 common, 122 soprano);
+  - half B: Aug 21, Aug 25, Sep 19 (175 common, 76 soprano).
+  - **The fitted boundary is stable:** 50.6 kHz from A, 50.2 kHz from B.
+  - **It doesn't help.** On held-out nights it trades common accuracy for soprano accuracy (common 33/46% → 27/32%; soprano 9/10% → 11/17%). It halves the soprano wrong-species rate (8/15% → 5/7%) and puts more passes in the group. Not adopted.
+- **Alternatives considered:**
+  - **Splicing calls into the board's noise:** rejected, too many artefacts of its own.
+  - **Fitting more of the rule table to this dataset:** rejected, the labels are in doubt.
+  - **The 2.1 GB "Human-verified bat acoustics" set (Zenodo 19420408, AudioMoth, CC0):** not tried. It may hold more species and expert labels, but its contents can't be checked without the download.
+- **Outcome:**
+  - The model runs end to end on real audio.
+  - It finds 96–98% of the calls.
+  - It reports nothing on noise.
+  - It rarely names a wrong species for the common pipistrelle.
+  - It can't yet tell common from soprano on this data. With overlap like this, neither a textbook nor a fitted boundary can.
+  - **Next:** a better-labelled set (xeno-canto by browser, ChiroVox on request, the user's own recordings in spring). Also try deciding the species on the pass's median frequency instead of a per-call vote: 81% per recording in-sample, against 69% per call.
+- **Lessons for future designs:**
+  - Every harness artefact here looked like a classifier failure at first. Rebuild real audio rather than splice into synthetic noise where the data allows.
+  - Check a labelled dataset against what's known about the classes before treating its labels as truth: here, the soprano frequencies.
+  - Fit as little as possible. Test on held-out nights, not held-out recordings, when the same animal can appear in many recordings.
+
+### 50. The classifier model on labelled recordings (xeno-canto, Biodiversity Ireland); calls kept on their own frequency (Nov 4)
+- **Decision:**
+  - Score the PC model on recordings labelled with their species, 11 species in all: 31 from xeno-canto and 9 from Biodiversity Ireland. The new tool is `Tools/labelled_calls.py`.
+  - **Adopted:** in a call, the peak is searched for only down to 16 kHz below the track's last point (`drop_max_khz` in `classify.py`). The 8 kHz rise rule now also applies while a call is starting.
+  - **Tested and not adopted:**
+    - learning the noise floor during calls: its premise was wrong;
+    - keeping low calls that fit no rule out of the vote: it made the results worse.
+- **Context:**
+  - Diary 49 left common vs soprano open, because the Zenodo labels were in doubt.
+  - The user downloaded labelled recordings by browser into `Captures/` (gitignored):
+    - xeno-canto originals, at 192 kHz. Four are 24-bit, so `classify.load_codes` now reads 24-bit. Two files were byte-identical copies, and the tool skips copies.
+    - Biodiversity Ireland's full-spectrum WAVs, at 256 and 312.5 kHz. Their narrated MP3s weren't used.
+- **Common vs soprano separate cleanly here.** The figure is each file's median f_char over its pipistrelle-band calls (QCF, 35–65 kHz):
+  - common 42.9–48.3 kHz (9 files);
+  - soprano 54.4–58.5 kHz (13 of 15; the other two hold 0 and 11 band calls);
+  - Nathusius' 39.2–40.9 kHz.
+  - That's a 6 kHz gap, inside the textbook ranges (common 42–49, soprano 53–58). The odd thing was the Zenodo set's 50–52 kHz "sopranos", not the rules.
+  - Half the xeno-canto soprano calls sit just above 58 kHz, where their score tapers over the 2 kHz margin. The range is unchanged: the Irish soprano is at 54.4 kHz, and a wider range should come from a reference rather than from these files.
+- **What went wrong** (40 files; before the change: 11 right, 8 group, 12 "Bat sp.", 9 wrong):
+  1. **Sounds at 10–35 kHz that aren't echolocation**, in about 12 files:
+     - Pipistrelle social calls (~20 kHz, 30–60 ms, several parts) are cut into short pieces that look like noctule calls. XC1033515 holds nothing but social calls and came out as noctule.
+     - An insect: an 11 kHz pulse pair every ~75 ms, in several files from one recordist. Elsewhere, denser insect noise up to 35 kHz.
+  2. **Calls jumped between sounds.** The tracker took each frame's strongest whitened bin anywhere in the band:
+     - the lesser horseshoe's 108 kHz call hopped to its own 54 kHz fundamental, read as a steep sweep, and came out "Bat sp.";
+     - soprano calls dropped to the 11 kHz insect at their ends.
+  3. **The verdict comes from the last 10 calls.** XC1018537 is a common pipistrelle with a nyctaloid at 27 kHz behind it. The pass ends on the other bat, so it read "Leisler's".
+  4. **Myotis:**
+     - Daubenton's echoes off water give each sweep a flat 40 kHz tail, read as QCF.
+     - The broadband rule drops 155 pieces of the Natterer's recording.
+     - With one recording each, these verdicts flip between "Bat sp." and a wrong group on small changes (their votes sit at 40–60%).
+- **The change:**
+  - **What it does:** in a call, the peak search starts 16 kHz below the last point. Rises are still left to the 8 kHz rule, which ends the call and starts a new one.
+  - **Why 16 kHz:** the steepest European sweep, Natterer's (~120 to 20 kHz in 2–3 ms), falls ~13 kHz per 0.256 ms frame.
+  - **The start-up case:** a call that starts on a lower sound and jumps up more than 8 kHz while starting now starts again at the new frequency. Before, horseshoe calls starting on the fundamental were logged as rising and dropped.
+  - **On the device:** the argmax loop starts at a higher bin during a call. That's less work, not more.
+- **Results:**
+
+  | | Before | After |
+  |---|---|---|
+  | Labelled files (40): right / group / Bat sp. / wrong | 11 / 8 / 12 / 9 | 12 / 9 / 10 / 9 |
+  | Lesser horseshoe | Bat sp. | Lesser horseshoe group, 81% (CF calls 10 → 13) |
+  | Zenodo common pipistrelle (246): right / wrong species | 37% / 1% | 41% / 1% |
+  | Zenodo soprano (198): right / wrong species | 10% / 12% | 10% / 15% |
+  | Self-test (board noise) | passes | passes; only change Natterer's f_char error 28.0 → 28.6 kHz |
+
+  - 27 of the 29 Zenodo soprano "wrong species" verdicts are common pipistrelle. Those sopranos sit at 50–52 kHz, inside the common range.
+  - "Before" on the labelled files is from the scratch script that became the tool. It joined the 0.6 s warm-up copy before resampling, and the tool after. That alone flips the Myotis and long-eared verdicts (12 / 9 / 11 / 8 by the scratch script after the change). The pipistrelle verdicts don't move.
+- **Not adopted:**
+  - **Learning the floor during calls.** I had proposed it after a full-file plot, where each column is the maximum of many frames and the insect looked like a raised floor. Frame by frame (XC1031661), the floor is right:
+    - between pulses the frame SNR sits at the usual ~7 dB;
+    - the insect is pulsed, and each pulse is 10–20 dB above it: a pulse, the same as a call at frame level;
+    - so learning during calls would change nothing here.
+  - **Low calls that fit no rule don't vote** (QCF below 17 kHz, the bottom of the Nyctaloid band, matching no species rule):
+    - 2,962 calls left the vote;
+    - 2 files went from "Bat sp." to a wrong group (XC1032612 to Nyctaloid, XC1038288 to Pipistrelle group), and none improved;
+    - with the 11 kHz pulses gone, the 15–30 kHz noise won the vote. "Bat sp." had been the honest answer.
+  - **The whole sequence as the voting window** (diary 49's pass-level idea):
+    - 11 → 12 right, but 8 → 3 group;
+    - 4 serotines went from Nyctaloid group to noctule, because the alternation rule fires over long windows.
+- **A correction to diary 49.** "It finds 96–98% of the calls and reports nothing on noise" came from an earlier test that spliced calls into the board's noise, and was dropped. Measured with the current code on the rebuilt recordings, against the dataset's own call/gap flags:
+  - 96.4% (common) and 96.0% (soprano) of its call pieces are found, within 2 ms;
+  - in its whole "silent" fragments (124 s) there are 1,691 detections, ~820 a minute;
+  - their median f_char is 16.8 kHz, at a median of 18 dB above the floor: real sounds (insects, recorder noise), not the threshold;
+  - 220 of them (13%) are QCF at 40–60 kHz, likely faint pipistrelles the dataset's detector missed.
+- **The self-test's noise capture is missing.** `Captures/20261030_143507_raw_quiet-room.npz` went when `Captures/` was cleared for the recordings. The user restored it from the Recycle Bin the same day.
+  - Without it, `bat_signals` falls back to white noise, and the self-test fails: one bench noctule call's f_char is 1.02 kHz off against a 1.0 kHz tolerance, with or without the change.
+  - On the board noise (a copy of the file), it passes.
+- **Outcome:**
+  - The textbook pipistrelle ranges hold on correctly labelled recordings.
+  - Calls now stay on their own frequency: the horseshoe is named, and soprano calls no longer end at 11 kHz.
+  - The biggest remaining error is sound in the 10–35 kHz band that isn't echolocation: social calls and insects. A vote over the last 10 calls lets it win.
+- **Next:**
+  - recognise social calls (a burst of pieces in 15–30 kHz within ~60 ms) and keep them out of the vote;
+  - a pass verdict that can name two bats;
+  - the Myotis shapes, once there are more recordings.
+- **Lessons for future designs:**
+  - Look at single frames before fixing. A plot that keeps the maximum of many frames per column makes a pulsed sound look like a raised floor.
+  - Taking evidence out of a vote can make it worse: if what's left is also noise, "Bat sp." turns into a wrong name. Test each rule on its own, against the verdicts, before adopting it.
+  - A test fixture outside git can disappear without a trace. The self-test only says "white, 6 codes rms" in its first line when it falls back.
+
+### 51. The species classifier on the board: a HAL-free port checked against the model on the PC (Nov 4)
+- **Decision:**
+  - Port the whole classifier (stages 1–6) to the firmware in one go, as the plan describes:
+    - a reader of the PSRAM ring in the main loop (`classifier.c`);
+    - stages 1–3 in `classifier_calls.c`, stages 4–6 in `classifier_species.c`, constants in `classifier_config.h`;
+    - the verdict in the header line for 5 s, in yellow;
+    - every call and verdict in `CALLS.CSV` (`call_log.c`), on by default.
+  - The two stage files use no HAL, so they also build on the PC. `Tools/check_classifier_c.py` builds them with MSYS2's gcc and compares them with the model call by call.
+- **Context:**
+  - After the findings (`Docs/CLASSIFIER_FINDINGS.md`) the user chose to go ahead: "lets turn this into code for the microcontroller and add the feature".
+  - They chose the call log on by default, and installed gcc (MSYS2 UCRT64, 16.2) so the C could be tested before flashing. With USB gone, the board's only way to report its calls is the SD card.
+- **How it works on the board:**
+  - A pass starting (`BatDetect_IsBatPresent`) opens a session at the ring block 2 s earlier, clamped to the ring's last resume and to 12 s back.
+  - Blocks are read one at a time into two 512-byte slots, as playback does: 4 blocks a poll, each 4 hops of 64 samples, one frame per hop.
+  - The session ends when the detector has let go (2 s after the last pulse) and the classifier has caught up with the ring. Then the open call and sequence are closed, and the log is written out.
+  - It does nothing while a recording is open or saving, or during playback. A pass that starts meanwhile is remembered, and picked up afterwards from what's still in the ring.
+  - Past 12 s behind, or once the ring has paused for a playback, it ends the session and starts again on newer audio. `classifierSkips` counts these: drop rather than corrupt.
+  - `classifierBlockCyclesMax` is timed with the DWT cycle counter around the frames only, not the log's SD writes. It's for Live Expressions.
+- **The FFT:** a 64-point complex FFT packing the 128 real samples, with fft.c's unpack. Its window, twiddles, unpack rotation and bit-reversal order are generated by `gen_dsp_tables.py` from `CLS_FFT_LENGTH`. A static assert catches stale tables.
+  - fft.c itself is untouched. It's verified against numpy, and making it size-generic would have meant re-verifying the waterfall for no gain.
+  - The board has no float `printf` (newlib-nano), so the log formats numbers with a small fixed-point writer.
+- **The check on the PC** (`check_classifier_c.py`): the C in float32 against the model in float64, on the same 12-bit codes.
+
+  | Audio | Calls (matched within a frame) | Same label | Sequence verdicts | f_char max diff |
+  |---|---|---|---|---|
+  | 13 bench signals | 242 / 242 | 100% | 10 / 10 | 0.00 kHz |
+  | 40 labelled recordings | 17,519 / 17,519 | 99.93% | 59 / 59 | 0.01 kHz |
+
+  - **The first run** had 99.87% of labels the same, one file verdict different (the long-eared bat), and f_char up to 5.46 kHz apart.
+  - **The cause:** on a flat tail several positions fit with exactly the same slope. Float32 and float64 rounded the slope sums differently, so they broke the tie at different positions.
+  - **The fix:** the fit is now done in whole 10 Hz units in both the C and the model. Equal slopes tie exactly, and the latest still wins.
+  - **Effect on the model:** none outside ties. Its self-test passes, and the labelled (12 / 9 / 10 / 9) and Zenodo (common 41% right, 1% wrong) results are unchanged.
+  - **The 12 calls (of 17,519) whose labels still differ** come from float32 slopes moving an extrapolated sweep end across a rule's edge. No sequence verdict changes.
+- **Checking the board itself:** `check_classifier_c.py --device CALLS.CSV BATnnnnn.WAV`.
+  - The log has ring positions and the WAV doesn't, so the two are lined up by the commonest offset between calls of the same frequency.
+  - Tested with logs made on the PC:
+    - shifted by 123,456 hops: the offset was found, and 108 of 108 calls matched;
+    - starting 2 s earlier, on other audio and 48 samples out of step with the frames: 81% of calls matched, and the longest verdict was the same.
+  - On the board, the WAV starts on a block boundary, so frames line up exactly.
+- **Costs:**
+  - RAM +4.3 KB:
+    - frames, call track and vote 2,686 B;
+    - ring slots and state 1,076 B;
+    - log buffer and file object 573 B.
+    - 28.7 of 32 KB now used, 3.3 KB free. The plan estimated 4.5 KB.
+  - Flash +15.6 KB, to 81.0 KB (the plan estimated 12–16 KB).
+  - Stack: the deepest path is about 0.8 KB, from `Classifier_Poll` through the vote or a FatFS append. That's inside the 2 KB stack with the audio interrupt on top.
+  - CPU: not measured yet; the plan estimated 11–19k cycles a frame.
+- **Alternatives considered:**
+  - **Step 1 alone** (stages 1–3 and the log) before stages 4–6: the user asked for the feature, and stages 4–6 cost under 1% of the CPU.
+  - **A size-generic fft.c**, or taking the 128-point tables from the 1024-point ones by striding: either would have coupled the classifier to the waterfall, or meant re-verifying fft.c.
+  - **Keeping the log file open for the whole session:** fewer SD operations. But the recorder remounts the card when it starts, and a file left open across that loses its unsynced lines.
+  - **Testing only on the board:** with no USB, a port bug would have looked like a classifier problem. The PC check pinned the one real difference (the f_char tie) in minutes.
+- **Outcome:**
+  - It builds clean, and the C reproduces the model on 17,519 real calls.
+  - It hasn't run on the board yet. To check there:
+    1. the audio, waterfall and recording are unaffected;
+    2. `classifierBlockCyclesMax` against the 174,080 cycles of real time;
+    3. a pass with the 40 kHz sensor gives a verdict;
+    4. `check_classifier_c.py --device` on a WAV and the log of the same pass.
+- **Lessons for future designs:**
+  - Write signal-processing code HAL-free from the start, and keep a PC model beside it. The same file then runs on recorded audio on the PC, and every difference is a real one.
+  - Where a model breaks ties with `<=` on a computed float, the port must compute the same thing in the same way, or the two will disagree at random. Integer arithmetic makes ties exact.
+
+### 52. The classifier's first run on the board: false passes indoors, and a smaller log (Nov 4)
+- **Decision:** `CALLS.CSV` gets one line per pass the classifier reports, by default: the verdict the header showed. Per-call lines are behind `CALL_LOG_CALLS` (off), for the board-vs-model check only.
+- **Context:**
+  - The user flashed the classifier: "the classifier is working". But tapping the mic gave a species, and in ~3 minutes by day, indoors near the PC with no bats about, the log grew to 511 call lines (49 KB). The user: "if a detection is made and its false lets not update the calls.csv file or its going to become incredible big."
+  - The user also asked to stop testing rules for now.
+- **What the log showed** (recorded for when the rules are revisited):
+  - 511 calls in 19 sequences; 17 reported: 8 "Bat sp.", 4 Nyctaloid group, 3 long-eared/barbastelle group, 1 noctule, 1 barbastelle.
+  - Two of them were in the first 5 s after each power-up.
+  - **The calls:** median 1.5 ms long, 90% below 31.5 kHz (median f_peak 19.6 kHz), median SNR 18.5 dB. Only 3 clipped the ADC.
+  - **The shape:** each sound event is cut into several "calls" 1–5 ms apart, at wandering frequencies (19, 44, 22 kHz within a few ms). Events come 100–900 ms apart.
+  - **Real calls overlap per call.** In the labelled recordings, 32% of noctule calls measure under 2 ms, against 52% of these.
+  - **Per sequence they don't.** The median length of the voting window's calls is 1.2–3.1 ms here (14 of 16 at 2.0 ms or less), against 1.4–22 ms in correctly named real passes (2 of 34 under 2.0 ms). Confidence is 0.30–0.62 here, against 0.43–0.95.
+  - **Untested ideas:** pieces of one sound (calls within a few ms, at frequencies more than 3 kHz apart) don't vote; a minimum median call length per sequence; a confidence floor for showing a verdict. The test of the first was stopped at the user's request.
+  - **Unknown:** how much of this is the PC (20–25 kHz energy, absent outdoors per the user) and how much is taps and handling, which happen in the field too.
+- **The change:**
+  - A sequence that isn't reported (fewer than 3 calls) is neither shown nor logged. A reported one is one line (~40 B), with its own header row (`type,first_hop,last_hop,calls,echoes,taxon,confidence,reported`).
+  - The same 3 minutes would have been 17 lines, about 0.7 KB.
+  - Flash 82,260 B (−636 B: the per-call formatter isn't linked).
+- **Then, the same day:** the user: "the faint calls should not be recorded. it seems like they are triggered too easily". Verdicts in the faint-sweep group ("FAINT", "PLESP", "BARBAR") were first kept out of the log only; then, at the user's next request ("ignore faint calls from the header too"), out of the header as well. One switch covers both: `CLASSIFIER_REPORT_FAINT` 0 in `classifier.h`. Of the 511 false calls, 145 were faint-sweep shaped, the group's rule being the loosest (any short sweep of 8–30 kHz that starts below 60 kHz). The cost: a real long-eared bat or barbastelle is neither shown nor logged; it can still turn up as part of a pass named something else. Their calls are very quiet and rarely picked up beyond a few metres anyway.
+- **Outcome:** the log stays small. Other false passes that get a verdict are still shown and logged until the rules change.
+- **Lesson:** log volume follows the false-alarm rate, not the bat rate. Size a log for the worst environment the device will sit in, here a desk next to a PC.
+
 ---
 
 ## Planned decisions (agreed, not built yet)

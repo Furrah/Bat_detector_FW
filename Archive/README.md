@@ -12,6 +12,5 @@ Source files that are no longer built, kept for reference and reuse. Nothing in 
 | `stats_table.c/.h` | The table of every timing and health counter, read by `capture.py stats`. | As above. |
 | `Diag/` | The reusable diagnostics library: DWT cycle timing, first-failure records, SPI/NVIC start-up checks, the stats table and the framed link. Its README says how to use it in another project. | As above; kept for future projects. |
 | `Tools/capture.py`, `analyse_capture.py`, `diaglink.py` | The PC side of the debug link: captures, analysis plots, the detector replay. | They need the `v2` firmware. |
-| `Tools/classify.py`, `bat_signals.py` | The species classifier model and the synthetic bat signals (diary 43). They run on any WAV, so they still work from here. | Parked with the classifier. |
 
 To use a file again, move it back under `Core/` and build once in CubeIDE, which regenerates the makefiles.

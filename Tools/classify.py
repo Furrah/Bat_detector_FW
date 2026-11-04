@@ -1,9 +1,10 @@
 """
 classify.py - numpy reference model of the bat species classifier
-(Docs/Bat Species Classifier.md), stages 1-3: the frame stage, the
-segmenter and the per-call features. It mirrors the C design step by step
-so the board can later be checked against it on the same samples, as the
-FFT was (capture.py fftcheck).
+(Docs/Bat Species Classifier.md, Docs/CLASSIFIER_PLAN.md). Stages 1-3, the
+frame stage, the segmenter and the per-call features, are here; stages 4-6,
+shape groups, species rules and sequence voting, are in species.py. It
+mirrors the C design step by step so the board can later be checked against
+it on the same samples.
 
 At 250 kHz the doc's frames (designed for 500 ksps) become a 128-point FFT
 with a 64-sample hop: the same 0.512 ms window, 1.95 kHz bins and a frame
@@ -12,7 +13,7 @@ every 0.256 ms, four frames per 256-sample audio block.
     python -I Tools/classify.py D:\\BAT00001.WAV [more files] [--plot] [--doc-params]
     python -I Tools/classify.py --selftest [--plot]
 
-Files: recorder WAVs, other 16-bit PCM WAVs (resampled to 250 kHz and
+Files: recorder WAVs, other 16- or 24-bit PCM WAVs (resampled to 250 kHz and
 scaled to 12-bit codes, as the board would see them) or .RAW ADC codes.
 --selftest runs the doc's bench signals (Tools/bat_signals.py), synthesised
 in the board's measured noise, and checks the features against the truth.
@@ -30,6 +31,8 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))    # -I leaves the script's folder off the path
+
+import species  # noqa: E402
 
 
 SAMPLE_RATE_HZ = 250_000
@@ -61,6 +64,10 @@ DOC_PARAMS = {
     "min_call_frames": 3,       # strong frames, else it was a click
     "harm_db": 10.0,            # 2nd harmonic counts if this far above its floor (not in the doc)
     "flat_slope": 2.0,          # kHz/ms: flatter than this counts as flat
+    "t_broad_db": None,         # broadband (rub) test: off in the doc; see PARAMS
+    "t_near_db": 10.0,
+    "t_raised_db": None,
+    "drop_max_khz": None,       # in a call, how far the peak may fall per frame: no limit in the doc
 }
 PARAMS = dict(DOC_PARAMS)
 PARAMS.update({
@@ -74,10 +81,28 @@ PARAMS.update({
     # Noise frames peak at +6.4 dB (median) re the mean, so a 6 dB t_off
     # called half of them strong and weak calls never ended. 2% reach 9 dB.
     "t_off_db": 9.0,
+    # A frame whose median bin is more than this above the mean noise is
+    # broadband (a rub, cloth, typing), not part of a call. The bench calls
+    # reach 2.1 dB at most, the synthetic rubs 14.6 dB at least.
+    "t_broad_db": 6.0,
+    "t_near_db": 10.0,
+    # A call most of whose frames have their median bin more than this above
+    # the mean noise is broadband: the edges of a rub. Bench calls stay at
+    # 2.1 dB or below in every frame; the rub fragments that get past the
+    # frame tests sit at 2-7 dB.
+    "t_raised_db": 3.0,
+    # In a call, the peak is searched for only down to this far below the
+    # track's last point (rises are left to rise_max_khz). The doc searches the
+    # whole band every frame, so a call jumped to whatever else was loudest:
+    # a horseshoe's 108 kHz call to its own 54 kHz fundamental, soprano calls
+    # to an insect at 11 kHz (diary 50). The steepest European sweep, Natterer's
+    # (~120 to 20 kHz in 2-3 ms), falls ~13 kHz per 0.256 ms frame.
+    "drop_max_khz": 16.0,
 })
 
 # per-point and per-call flags (doc: PT_GAP, PT_CLIP; CALL_TRUNCATED, CALL_GAPPED, CALL_CLIPPED)
 PT_CLIP = 2
+PT_RAISED = 4                                   # the frame's median bin is raised (not in the doc)
 CALL_TRUNCATED, CALL_GAPPED, CALL_CLIPPED = 1, 2, 4
 
 IDLE, ARMING, IN_CALL = 0, 1, 2
@@ -128,18 +153,24 @@ def load_codes(path):
         raise ValueError("not a WAV file")
     fmt_offset, _ = chunks[b"fmt "]
     audio_format, channels, rate, _, _, bits = struct.unpack_from("<HHIIHH", raw, fmt_offset)
-    if audio_format not in (1, 0xFFFE) or bits != 16:
-        raise ValueError(f"only 16-bit PCM WAVs are read (format {audio_format}, {bits}-bit)")
+    if audio_format not in (1, 0xFFFE) or bits not in (16, 24):
+        raise ValueError(f"only 16- and 24-bit PCM WAVs are read (format {audio_format}, {bits}-bit)")
     data_offset, data_bytes = chunks[b"data"]
     data_bytes = min(data_bytes, len(raw) - data_offset)
-    samples = np.frombuffer(raw, "<i2", count=data_bytes // 2 // channels * channels,
-                            offset=data_offset).reshape(-1, channels)[:, 0]
+    width = bits // 8
+    frames = data_bytes // width // channels
+    b = np.frombuffer(raw, np.uint8, count=frames * channels * width,
+                      offset=data_offset).reshape(frames, channels, width)[:, 0, :]
+    if bits == 16:
+        samples = b.copy().view("<i2").reshape(-1)
+        if rate == SAMPLE_RATE_HZ and not np.any(samples & 0xF):
+            return (samples.astype(np.int64) >> 4) + ADC_MIDSCALE, "recorder WAV"
+        x = samples.astype(np.float64)
+    else:
+        v = b[:, 0].astype(np.int32) | (b[:, 1].astype(np.int32) << 8) | (b[:, 2].astype(np.int32) << 16)
+        x = np.where(v & 0x800000, v - 0x1000000, v).astype(np.float64) / 256    # to the 16-bit scale
 
-    if rate == SAMPLE_RATE_HZ and not np.any(samples & 0xF):
-        return (samples.astype(np.int64) >> 4) + ADC_MIDSCALE, "recorder WAV"
-
-    x = samples.astype(np.float64)
-    note = f"{rate} Hz WAV"
+    note = f"{rate} Hz {bits}-bit WAV"
     if rate != SAMPLE_RATE_HZ:
         x = resample(x, rate)
         note += ", resampled to 250 kHz"
@@ -222,7 +253,7 @@ class Segmenter:
         self.n = self.off = 0
         self.track = Track()
         self.calls = []
-        self.stats = {"arms": 0, "aborted_arms": 0, "clicks": 0, "rise_splits": 0}
+        self.stats = {"arms": 0, "aborted_arms": 0, "clicks": 0, "rise_splits": 0, "broadband": 0}
 
     def start(self, frame, f, snr, harm, flags):
         self.state, self.n = ARMING, 1
@@ -240,6 +271,13 @@ class Segmenter:
             if snr < p["t_on_db"]:
                 self.state = IDLE
                 self.stats["aborted_arms"] += 1
+                return
+            if p["drop_max_khz"] is not None and f - self.track.last_f > p["rise_max_khz"]:
+                # Started on something lower, a harmonic's fundamental say, and
+                # jumped up: start again here (as rise_max does in a call).
+                # Not in the doc; goes with drop_max_khz.
+                self.stats["aborted_arms"] += 1
+                self.start(frame, f, snr, harm, flags)
                 return
             self.track.push(f, snr, harm, flags, True, False)
             self.n += 1
@@ -263,6 +301,9 @@ class Segmenter:
     def end_call(self):
         if self.track.n_strong < self.p["min_call_frames"]:
             self.stats["clicks"] += 1
+            return
+        if self.track.flags and sum(1 for f in self.track.flags if f & PT_RAISED) * 2 >= len(self.track.flags):
+            self.stats["broadband"] += 1        # not in the doc: mostly raised frames, a rub
             return
         call = extract_features(self.track, self.p)
         if call is not None:
@@ -288,10 +329,14 @@ def extract_features(t, p):
     m = i1 - i0 + 1
     f = np.array(t.f_10hz, dtype=np.int64)
 
-    def F(i):
-        """kHz: 3-point median of the track, indices clamped to the call"""
+    def F10(i):
+        """10 Hz units: 3-point median of the track, indices clamped to the call"""
         a, b, c = f[max(i - 1, i0)], f[i], f[min(i + 1, i1)]
-        return float(sorted((a, b, c))[1]) * 0.01
+        return int(sorted((a, b, c))[1])
+
+    def F(i):
+        """kHz"""
+        return float(F10(i)) * 0.01
 
     def lsq_slope(start, count):
         """kHz/ms, least squares over count frames"""
@@ -330,11 +375,14 @@ def extract_features(t, p):
     # Changed from the doc, which takes the flattest single step: on a QCF
     # tail every step is about as flat, so frame noise picked a random point
     # in it (24.0-25.1 kHz on a 25 -> 24 kHz tail). Here the slope is fitted
-    # over 4 frames (0.77 ms) and the latest minimum wins.
+    # over 4 frames (0.77 ms) and the latest minimum wins. The fit is in
+    # whole 10 Hz units (x2, so |slope| = this * 0.01 / (10 * HOP_MS)): equal
+    # slopes then tie exactly. In floats, rounding broke ties differently in
+    # the C (float32) and here (float64), up to 5.5 kHz apart (diary 51).
     best = math.inf
     c["f_char"] = c["f_end"]
     for i in range(max(i0 + 3, i0 + (6 * m) // 10), i1 + 1):
-        slope = abs(-1.5 * F(i - 3) - 0.5 * F(i - 2) + 0.5 * F(i - 1) + 1.5 * F(i)) / (5 * HOP_MS)
+        slope = abs(-3 * F10(i - 3) - F10(i - 2) + F10(i - 1) + 3 * F10(i))
         if slope <= best:
             best, c["f_char"] = slope, F(i)
 
@@ -364,8 +412,12 @@ def analyse(codes, p=PARAMS, max_columns=3000):
     up, down = p["nf_up"], p["nf_down"]
     harm_ratio = 10 ** (p["harm_db"] / 10)
     t_on = p["t_on_db"]
+    broad = 10 ** (p["t_broad_db"] / 10) if p["t_broad_db"] is not None else math.inf
+    near = 10 ** (-p["t_near_db"] / 10)
+    raised_level = 10 ** (p["t_raised_db"] / 10) if p["t_raised_db"] is not None else math.inf
 
     snr_trace = np.zeros(n_frames, dtype=np.float32)
+    median_trace = np.zeros(n_frames, dtype=np.float32)
     state_trace = np.zeros(n_frames, dtype=np.int8)
     idle_before = np.zeros(n_frames, dtype=bool)
     group = max(1, math.ceil(n_frames / max_columns))      # frames per spectrogram column
@@ -393,9 +445,28 @@ def analyse(codes, p=PARAMS, max_columns=3000):
                 continue
 
             ratio = pb / (nf * bias)
-            kr = int(np.argmax(ratio))
+            kg = int(np.argmax(ratio))              # the whole band: starts a call, and the broadband test
+            kr = kg
+            if seg.state != IDLE and p["drop_max_khz"] is not None:
+                # in a call: no further down than drop_max below its last point
+                lo = max(0, math.ceil((seg.track.last_f - p["drop_max_khz"]) / BIN_KHZ) - K_LO)
+                if kg < lo:
+                    kr = lo + int(np.argmax(ratio[lo:]))
             kb = kr + K_LO
             snr = 10 * math.log10(ratio[kr]) if ratio[kr] > 0 else -99.0
+            # Broadband test (not in the doc; Docs/CLASSIFIER_PLAN.md). A
+            # tone or a sweep lifts a few bins of the whitened spectrum; a rub
+            # lifts them all. Two counts, each one pass over the bins in C:
+            #   - more than half the bins above t_broad (the median is up):
+            #     the bench calls reach 2.1 dB, the synthetic rubs 14.6 dB+;
+            #   - more than half the bins within t_near of the peak: catches
+            #     a rub's rising and falling edges, where the median is still
+            #     low but the spectrum is as flat as noise.
+            median_trace[j] = 10 * math.log10(max(float(np.median(ratio)), 1e-30))
+            raised = p["t_raised_db"] is not None and np.count_nonzero(ratio > raised_level) * 2 > ratio.size
+            if p["t_broad_db"] is not None and (np.count_nonzero(ratio > broad) * 2 > ratio.size
+                                                or np.count_nonzero(ratio > ratio[kg] * near) * 2 > ratio.size):
+                snr = min(snr, p["t_off_db"] - 0.01)    # broadband: can't start or carry a call
             # The bin is picked on the whitened spectrum, but the frequency
             # is the call's own: step to a neighbour with more raw power, or
             # the parabola's offset clamps at +-0.5 bin (sticks at half bins).
@@ -411,7 +482,7 @@ def analyse(codes, p=PARAMS, max_columns=3000):
             harm = 2 * kb <= K_HI and P[r, 2 * kb] > harm_ratio * bias * nf[2 * kb - K_LO]
 
             idle_before[j] = seg.state == IDLE
-            seg.step(j, f, snr, harm, PT_CLIP if clipped[j] else 0)
+            seg.step(j, f, snr, harm, (PT_CLIP if clipped[j] else 0) | (PT_RAISED if raised else 0))
             snr_trace[j] = snr
             state_trace[j] = seg.state
 
@@ -438,7 +509,7 @@ def analyse(codes, p=PARAMS, max_columns=3000):
     # where the floor sits against the mean noise power, while idle
     res.stats["floor_vs_mean_db"] = (float(np.median(10 * np.log10(nf_sum / idle_power)))
                                      if idle_frames else math.nan)
-    res.snr_trace, res.state_trace = snr_trace, state_trace
+    res.snr_trace, res.state_trace, res.median_trace = snr_trace, state_trace, median_trace
     res.spectrogram = np.array(columns).T
     res.column_s = group * HOP / SAMPLE_RATE_HZ
     res.nf = nf
@@ -459,12 +530,13 @@ FIELDS = [
 
 
 def call_table(calls, limit=40):
-    lines = ["  " + " ".join(f"{h:>{len(fmt.format(0))}}" for _, h, fmt in FIELDS) + "  h flags"]
+    lines = ["  " + " ".join(f"{h:>{len(fmt.format(0))}}" for _, h, fmt in FIELDS) + "  h flags  group     label"]
     for c in calls[:limit]:
         flags = "".join(ch for bit, ch in ((CALL_TRUNCATED, "T"), (CALL_GAPPED, "G"), (CALL_CLIPPED, "C"))
                         if c["flags"] & bit)
+        label = "echo" if c.get("echo") else f"{c.get('label') or '':<6} {c.get('score', 0.0):.2f}"
         lines.append("  " + " ".join(fmt.format(c[k]) for k, _, fmt in FIELDS)
-                     + f"  {'y' if c['harmonic'] else '-'} {flags}")
+                     + f"  {'y' if c['harmonic'] else '-'} {flags:<5}  {c.get('group', ''):<9} {label}")
     if len(calls) > limit:
         lines.append(f"  ... {len(calls) - limit} more")
     return "\n".join(lines)
@@ -474,10 +546,24 @@ def print_summary(res, p):
     s = res.stats
     minutes = max(s["seconds"] - p["settle_frames"] * HOP / SAMPLE_RATE_HZ, 1e-9) / 60
     print(f"  {s['seconds']:.2f} s, {s['frames']:,} frames; {len(res.calls)} calls ({len(res.calls) / minutes:.1f}/min), "
-          f"{s['clicks']} clicks, {s['aborted_arms']} aborted starts, {s['rise_splits']} rise splits"
+          f"{s['clicks']} clicks, {s['broadband']} broadband, {s['aborted_arms']} aborted starts, {s['rise_splits']} rise splits"
           + (f", {res.clipped_hops} clipped hops" if res.clipped_hops else ""))
     print(f"  while idle: frame SNR median {s['idle_snr_median']:.1f} dB, {100 * s['idle_over_t_on']:.2f}% of frames "
           f"at or above t_on ({p['t_on_db']:.0f} dB); floor {s['floor_vs_mean_db']:+.1f} dB re the mean noise power")
+
+
+def sequence_table(sequences):
+    lines = []
+    for s in sequences:
+        if not s.reported:
+            continue
+        lines.append(f"  {s.start_s:7.2f}-{s.end_s:7.2f} s  {len(s.calls):3d} calls ({s.echoes} echoes)  "
+                     f"{s.taxon:<6} {s.name} ({s.level}), confidence {100 * s.confidence:.0f}%, "
+                     f"tune {s.tune_khz:.1f} kHz   header \"{species.header_text(s)}\"")
+    short = sum(1 for s in sequences if not s.reported)
+    if short:
+        lines.append(f"  {short} run(s) of fewer than {species.SEQ_MIN_CALLS} calls: not reported (no bat)")
+    return "\n".join(lines) if lines else "  no sequences"
 
 
 # ---------------------------------------------------------------- plot
@@ -570,6 +656,33 @@ EXPECT = {
     "noctule": [("f_char", None, 1.0)],         # 20 / 24 alternating: checked against the truth
     "cricket-pip": [("f_char", 45.0, 1.0)],
     "pip45-echo": [("f_char", 45.0, 1.0)],
+    "soprano55": [("f_char", 55.0, 1.0)],
+    # Sloping tails: f_char is the flattest point of the last 40% of the call,
+    # and on a tail of constant slope every point there is equally flat, so it
+    # can land anywhere in it. Tolerance: 1 kHz plus the tail's change over
+    # that 40% (Leisler's 0.8 kHz, serotine 1.3 kHz). The rules' soft margins
+    # are 2 kHz.
+    "leisler": [("f_char", None, 1.0 + 0.8)],
+    "serotine": [("f_char", 25.0, 1.0 + 1.3)],
+    "natterer": [],
+}
+
+# stages 4-6: the acceptable verdicts per bench signal; an empty set means
+# nothing may be reported (no bat)
+EXPECT_ID = {
+    "cf82": {"RHIFER"},
+    "fm100-30": {"MYOSP"},          # ends near 30 kHz: no Myotis species has a rule there
+    "pip45": {"PIPPIP"},
+    "noctule": {"NYCNOC"},
+    "cricket-pip": {"PIPPIP"},
+    "pip45-echo": {"PIPPIP"},
+    "noise": set(),
+    "soprano55": {"PIPPYG"},
+    "leisler": {"NYCLEI"},
+    "serotine": {"EPTSER", "NYCGRP"},   # the doc: often group only
+    "natterer": {"MYONAT", "MYOSP"},
+    "rub-flat": set(),
+    "rub-tilt": set(),
 }
 
 
@@ -582,8 +695,10 @@ def selftest(p, plot_dir=None):
     print(f"  {'signal':<12} {'calls':>5} {'found':>5} {'extra':>5} {'split':>5}   median error: "
           f"{'dur':>5} {'start':>6} {'end':>6} {'char':>6} {'peak':>6}   check")
     all_passed = True
+    id_lines = []
     for s in bat_signals.bench_signals(noise):
         res = analyse(s.codes(), p)
+        sequences = species.identify(res.calls)
         pairs, extra, split = match_calls(res.calls, s.calls)
         verdicts = []
         for key, target, tol in EXPECT.get(s.name, []):
@@ -604,6 +719,20 @@ def selftest(p, plot_dir=None):
               + "   " + ", ".join(verdicts))
         if plot_dir:
             plot(res, p, plot_dir / f"selftest_{s.name}.png", f"{s.name}: {s.description}", s.calls)
+
+        reported = [q for q in sequences if q.reported]
+        verdicts_id = sorted({q.taxon for q in reported})
+        expected = EXPECT_ID.get(s.name)
+        if expected is not None:
+            ok = (not reported) if not expected else (len(reported) == 1 and reported[0].taxon in expected)
+            all_passed &= ok
+            got = ", ".join(f"{q.taxon} {100 * q.confidence:.0f}% ({len(q.calls)} calls, {q.echoes} echoes)"
+                            for q in reported) or "nothing reported"
+            want = " or ".join(sorted(expected)) or "nothing"
+            id_lines.append(f"  {s.name:<12} {got:<44} want {want:<16} {'ok' if ok else 'FAIL'}")
+
+    print("\n  Species (stages 4-6):")
+    print("\n".join(id_lines))
 
     print("\n  pip45 at lower levels (dB re noise rms above 10 kHz):")
     for s in bat_signals.level_sweep(noise, [-10, -5, 0, 5, 10]):
@@ -646,9 +775,12 @@ def main():
         codes, note = load_codes(path)
         print(f"{path}: {note}")
         res = analyse(codes, p)
+        sequences = species.identify(res.calls)
         print_summary(res, p)
         if res.calls:
             print(call_table(res.calls, limit=10**9 if args.all_calls else 40))
+        print("  sequences:")
+        print(sequence_table(sequences))
         if args.plot:
             plot(res, p, path.with_suffix(".png"), path.name)
     return 0

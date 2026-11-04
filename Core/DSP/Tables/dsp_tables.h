@@ -14,6 +14,8 @@
 #define DSP_TABLES_FFT_LENGTH   1024U   /* real samples per FFT frame */
 #define DSP_TABLES_CFFT_LENGTH  512U    /* complex FFT length */
 #define DSP_TABLES_SINE_LENGTH  512U    /* heterodyne NCO table entries */
+#define DSP_TABLES_CLS_FFT_LENGTH   128U   /* the species classifier's FFT */
+#define DSP_TABLES_CLS_CFFT_LENGTH  64U
 
 
 /* Hann window, one coefficient per real sample */
@@ -29,6 +31,15 @@ extern const float fftUnpackSin[DSP_TABLES_CFFT_LENGTH];
 
 /* One sine cycle for the heterodyne NCO, full scale 32767 */
 extern const int16_t dspSineTable[DSP_TABLES_SINE_LENGTH];
+
+/* The species classifier's FFT: the same four tables at its length, and the
+ * bit-reversed order of its complex FFT's indices */
+extern const float clsHannWindow[DSP_TABLES_CLS_FFT_LENGTH];
+extern const float clsTwiddleRe[DSP_TABLES_CLS_CFFT_LENGTH / 2U];
+extern const float clsTwiddleIm[DSP_TABLES_CLS_CFFT_LENGTH / 2U];
+extern const float clsUnpackCos[DSP_TABLES_CLS_CFFT_LENGTH];
+extern const float clsUnpackSin[DSP_TABLES_CLS_CFFT_LENGTH];
+extern const uint8_t clsBitReverse[DSP_TABLES_CLS_CFFT_LENGTH];
 
 
 #endif /* DSP_TABLES_H_ */

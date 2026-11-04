@@ -33,6 +33,7 @@
 #include "autotune.h"
 #include "bat_detect.h"
 #include "boot_checks.h"
+#include "classifier.h"
 #include "dac.h"
 #include "dsp.h"
 #include "fft.h"
@@ -149,6 +150,7 @@ int main(void)
   DSP_Init();
   BatDetect_Init();
   AutoTune_Init();
+  Classifier_Init();
   DAC_Init();
   FFT_Init();
 
@@ -196,6 +198,7 @@ int main(void)
   {
     UI_Poll();          // every 10 ms: knobs, buttons, header line, LEDs
     Recorder_Poll();    // WAV recording, ahead of the FFT: the PSRAM ring holds only 16.8 s
+    Classifier_Poll();  // species: reads each bat pass back from the ring (stands aside while recording)
     FFT_Process();
     UI_PollDisplay();   // the waterfall's rows (and auto-tune), the battery readout
 

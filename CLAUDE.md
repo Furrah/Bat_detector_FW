@@ -16,12 +16,12 @@ Handheld, battery-powered ultrasonic bat detector covering the 20–120 kHz echo
 
 - CubeMX-generated files: only edit inside `/* USER CODE BEGIN */ … /* USER CODE END */` blocks. Anything outside is wiped when the .ioc is regenerated.
 - Make incremental, targeted changes scoped to the function or module in question, with the rationale stated. No whole-file rewrites.
-- RAM: 6.8 KB free (25.8 of 32 KB used). That includes a 2 KB stack, a 0.5 KB heap reservation, ~1 KB of PSRAM-ring interrupt code that runs from RAM, the recorder's 8 KB slot buffer and playback's 1 KB. No malloc, no large stack buffers.
-- Flash: 65.7 KB of 128 KB used at `-Og` (89.6 KB on `v2` with the debug link and USB). Large constant tables belong in flash rather than RAM.
+- RAM: 3.3 KB free (28.7 of 32 KB used, Nov 4). That includes a 2 KB stack, a 0.5 KB heap reservation, ~1 KB of PSRAM-ring interrupt code that runs from RAM, the recorder's 8 KB slot buffer, playback's 1 KB and the species classifier's 4.3 KB. No malloc, no large stack buffers.
+- Flash: 80.3 KB of 128 KB used at `-Og`, ~15 KB of it the classifier (89.6 KB on `v2` with the debug link and USB, no classifier). Large constant tables belong in flash rather than RAM.
 - Interrupt priorities: DMA2 Channel 1 (the PSRAM ring's burst interrupt) must be the only interrupt at priority 0; everything else at 1 or lower. `PsramRing_Start()` refuses to run otherwise (boot screen: "Ring: NVIC prio"). Diary entry 34.
   - CubeMX defaults a newly enabled peripheral interrupt to priority 0. It did that to SPI2's global interrupt (Nov 2); check every new interrupt's priority after generating.
   - `__disable_irq()` blocks priority 0 too. Keep masked sections in code that runs while the ring is busy to a few dozen instructions: a masked section that delays a burst's end stretches CE#. Bursts have ~3.5 µs of slack (entry 36).
-- Lookup tables are generated into `Core/DSP/Tables/` by `python Tools/gen_dsp_tables.py`: the Hann window, FFT twiddles, FFT unpack rotation and NCO sine. Don't edit them by hand. Rerun the script after changing `AUDIO_FFT_LENGTH` or `LUT_SIZE`; a static assert fails the build if a table is stale. Python 3 is installed.
+- Lookup tables are generated into `Core/DSP/Tables/` by `python Tools/gen_dsp_tables.py`: the Hann window, FFT twiddles, FFT unpack rotation and NCO sine. Don't edit them by hand. It also makes the classifier's 128-point set. Rerun the script after changing `AUDIO_FFT_LENGTH`, `LUT_SIZE` or `CLS_FFT_LENGTH`; a static assert fails the build if a table is stale. Python 3 is installed.
 - Check `arm-none-eabi-size` after changes that add buffers or tables. When reading the .map, skip the "Discarded input sections" list at the top: symbols there were garbage-collected and use no memory.
 - Do not add the prebuilt CMSIS-DSP library: the static archive bakes in every twiddle table and overflowed flash by ~9 KB. The FFT is hand-rolled on purpose. If CMSIS-DSP is ever needed, use the source-only library so size-reduction defines work.
   - Its CubeMX packs (X-CUBE-ALGOBUILD, FP-SNS-STAIOTCFT) were removed on Nov 3. Unticking their components wasn't enough: the packs stayed attached in the `.ioc` (`Mcu.ThirdParty0/1`), and CubeIDE's stored CubeMX defaults in `.cproject` (the `build.inputs` string) still listed the library. So every Generate Code put `-l:libarm_cortexM4lf_math.a` back, and a fresh clone failed to link. Both are clean now. If a library ever reappears in the linker settings, check those two places.
@@ -94,7 +94,7 @@ To measure something (DSP load, CE# time, FFT against numpy), use `v2`, or port 
 - **`dsp_filters.c`:** Butterworth biquad low-pass/high-pass design and processing only. The notch filter and DC blocker are gone (never connected); they're in `v2`.
 - **`dac.c`:** each block is copied into the half of the circular DAC buffer that the DMA isn't reading, chosen from `CNDTR`.
 - **`fft.c`:** 1024 real samples packed into a 512-point complex FFT, Hann window, unpacked with the half-length real-FFT identity: 513 unnormalised linear-magnitude bins in `fftMagnitude[]`, with `fftMagnitudeReady`.
-  - Window, twiddles and unpack rotation come from the flash tables. It builds at `-O2` via a `#pragma`; bit reversal uses `RBIT`. About 2.3 ms a frame.
+  - Window, twiddles and unpack rotation come from the flash tables. It builds at `-O2` via a `#pragma`; bit reversal uses `RBIT`. About 1.3 ms a frame (216k cycles at `-O2`, interrupts included; diary 39).
   - `FFT_AddSamples` (in the interrupt) drops blocks while a frame waits; `FFT_Process` runs in the main loop.
   - Verified against numpy `rfft` (6.8e-8 of the largest bin, Nov 2, on v2).
 - **`waterfall.c`:** 240 columns over 0–125 kHz (bins 0–1 skipped, ~2.1 bins per column, peak-held between rows), thermal palette, hardware scroll (VSCRDEF/VSCRSADD in the afiskon driver), kHz ticks every 20 kHz. The axis is absolute: the FFT is of the raw ADC. `Waterfall_DrawAxis()` draws it once; `ui.c` owns the header line. `Waterfall_SetRange(-10, 20)` was calibrated on V1; recalibrate for the 140× front end.
@@ -134,9 +134,19 @@ To measure something (DSP load, CE# time, FFT against numpy), use `v2`, or port 
   - PLAYBACK is refused while a recording is open ("PLAY: busy"), RECORD during playback ("REC: playing"). The header shows "REC   1:23".
   - Measured on v2: slowest write 15.3 ms, slowest sync 6.1 ms; 8-sector writes 1.38× real time catching up, 1.93× caught up. Still to test: a 10-minute recording, a power cut (S1), recording straight after a playback.
   - `python -I Tools/check_raw.py D:\BAT00001.WAV` checks a recording on the PC: the header, and every sample a 12-bit code × 16.
-- **`ui.c`:** the front panel: buttons (debounce, long press), knobs (ADC2 scan of LO pot, volume, V_BAT/2 every 10 ms), LEDs, the header line, waterfall rows with auto-tune, and the battery readout ("BAT" over "3.9", top right). Volume is square-law. The LO label is fixed at 13 characters so it clears the battery readout.
+- **`classifier.c`:** the species classifier on the board (diary 51–52; `Docs/CLASSIFIER_PLAN.md`, `Docs/CLASSIFIER_FINDINGS.md`). Runs on the board (the user, Nov 4).
+  - **Known problem: false passes indoors.** In 3 minutes by day near the PC, with taps, it reported 17 passes ("BATSP", "NYCGRP", "FAINT", ...). They're made of 1–3 ms pieces at 15–35 kHz, several within 1–5 ms of each other at wandering frequencies (diary 52). The user paused rule work on this.
+  - When the detector starts a pass, it reads the pass back from the ring in the main loop, from 2 s before it began, 4 blocks per poll in two 512-byte slots (as playback). It ends when the pass is over and it has caught up.
+  - It stands aside while a recording is open or saving and during playback. More than 12 s behind, or across a ring pause, it ends the session and starts again on newer audio (`classifierSkips`).
+  - `classifier_calls.c` (stages 1–3: 128-point frames, segmenter, features) and `classifier_species.c` (stages 4–6: shape groups, European rules, vote) are a HAL-free port of `Tools/classify.py` and `species.py`. Their constants are in `classifier_config.h`; keep them in step with the model.
+  - Each reported sequence's verdict shows in the header for 5 s, in yellow ("PIPPIP 87%  9").
+  - Faint-sweep verdicts ("FAINT", "PLESP", "BARBAR": long-eared bats, barbastelle) are neither shown nor logged (`CLASSIFIER_REPORT_FAINT` 0 in `classifier.h`): indoor noise and taps were named that way too easily (the user, Nov 4).
+  - `CALLS.CSV` (`call_log.c`; `CALL_LOG_ENABLED`, on by default as the user chose) gets one line per *reported* pass, the verdict the header showed (~40 B). Detections it doesn't report never reach the card. `CALL_LOG_CALLS 1` adds a line per call (~100 B each), needed for `check_classifier_c.py --device`, but it grew ~50 KB in 3 minutes indoors, so it's off. Lines are buffered 512 B at a time: mount, append, close, so nothing is open when the recorder takes the card.
+  - `classifierBlockCyclesMax` (Live Expressions): the most cycles one ring block of frames has taken. Real time is 174,080. Not measured yet.
+  - `python -I Tools/check_classifier_c.py <WAVs or folders> [--bench]` builds the two HAL-free files with MSYS2 gcc (`C:/msys64/ucrt64/bin`) and compares them with the model call by call. `--device D:\CALLS.CSV D:\BAT00001.WAV` compares the board's log with the model on a WAV of the same pass.
+- **`ui.c`:** the front panel: buttons (debounce, long press), knobs (ADC2 scan of LO pot, volume, V_BAT/2 every 10 ms), LEDs, the header line (including the classifier's verdict), waterfall rows with auto-tune, and the battery readout ("BAT" over "3.9", top right). Volume is square-law. The LO label is fixed at 13 characters so it clears the battery readout.
 - **`boot_checks.c`:** SPI2 set-up (8-bit, NSSP off, PB13–15 High speed: "SPI2: config"), PSRAM reset/ID and ring start ("PSRAM: no reply", "Ring: NVIC prio", ...), SD mount (type and size, or why not).
-- **`main.c`:** CubeMX init, then the modules, the display, the boot checks and the audio start. The loop is `UI_Poll`, `Recorder_Poll`, `FFT_Process`, `UI_PollDisplay`.
+- **`main.c`:** CubeMX init, then the modules, the display, the boot checks and the audio start. The loop is `UI_Poll`, `Recorder_Poll`, `Classifier_Poll`, `FFT_Process`, `UI_PollDisplay`.
 - **USB:** removed on this branch (Nov 4). USB_DEVICE, the USB peripheral, CRS and HSI48 are off in CubeMX; they only served the debug link. The hardware is unchanged. `main.c`'s per-file include list in `.cproject` still names the USB and `Core/Diag` folders: harmless (GCC skips missing folders), tidy it with CubeIDE closed.
 - **V2 port, still to do:** recalibrate `DSP_GAIN` and `Waterfall_SetRange` for the 140× front end.
 
@@ -174,7 +184,7 @@ Bugs already fixed — do not reintroduce:
   3. SD bring-up. Done (Nov 2, diary 38–40): format, mount, recovery, and 8-sector polled writes keeping up under full recording load, with the data verified on the PC.
   4. RAM reclaim (done Oct 30), then the DMA-driven PSRAM ring buffer (verified Oct 30), then WAV recording to SD (verified Nov 2; long-run and power-cut tests still to do).
   5. Time-expansion playback from PSRAM on PLAYBACK. Version 1 built (fixed 10×, last 2 s). Next: start at the detector's last bat pass; a knob-set factor.
-- Detector tonality test (diary 44): finger rubs still trigger passes. Design a shape test (a call is a tone or a sweep, a rub is broadband) on the PC against the finger-rub WAVs and `Archive/Tools/bat_signals.py`, then port it. It should also help with quiet bats and calls under insects.
+- Detector tonality test (diary 44): finger rubs still trigger passes. The classifier's broadband rules (diary 48) reject synthetic rubs on the PC. Next, run them on the real finger-rub, typing and trouser WAVs (old SD card), then port them with the classifier.
 - Amplifier gating ("squelch"): switch `AMP_EN` on only while bats are detected.
   - Stage 1 (the monitor-only detector) is built; tune it in the field first.
   - Stage 2: drive `AMP_EN` from it, with a fade, amp off at zero volume, and forced on during playback.
@@ -183,10 +193,34 @@ Bugs already fixed — do not reintroduce:
   - Measured under recording load (diary 39–40): single-sector writes can't keep up (0.88×); 8-sector polled multi-block writes can (1.38× catching up, 1.93× caught up), using an 8 KB double buffer. The recorder has its own 8 KB slot buffer and syncs every 2 s (diary 41).
 - Finish the DSP chain: bandpass around the 1–2 kHz output, float throughout to avoid inter-stage truncation, and a notch filter if one is needed (v2's unconnected one was removed on `essential`).
 - Time-expansion mode: capture a detected call from PSRAM and play it back slowed down. The record button writes the PSRAM pre-trigger data to SD, followed by the live stream.
-- Species classifier (`Docs/Bat Species Classifier.md`): parked on the device (diary 43). It needs ~3.6 KB of RAM and an estimated 23–44% of the CPU, and there's no bat data to fit its rules until spring.
-  - `Archive/Tools/classify.py` (runs as before; it and `bat_signals.py` moved together) models stages 1–3 (frames, segmenter, features) at 250 kHz: 128-point FFT, 64-sample hop. It runs on any WAV or `.RAW` (`--plot` draws the call tracks over a spectrogram). Five changes from the doc are listed in diary 43; `--doc-params` runs the doc's original values.
-  - `python -I Archive/Tools/classify.py --selftest` runs the doc's bench signals (`bat_signals.py`, synthesised in the board's measured noise; it also writes them to `Captures/synth`) and must pass after any change to the model.
-  - Next: stages 4–6 on the PC; fit the rules to recorded passes in spring. If it proves accurate, the first on-device option is classifying a pass on demand from the PSRAM ring, sharing the recorder's buffer.
+- Species classifier: plan agreed Nov 4 (`Docs/CLASSIFIER_PLAN.md`, diary 48; the original design is `Docs/Bat Species Classifier.md`).
+  - It reads each detector pass back from the PSRAM ring in the main loop, never in an interrupt. About 4.5 KB of RAM, 128-point frames with a 64-sample hop.
+  - User's choices: the label goes in the header line ("PIPPIP 87%  9"); it waits while a recording is open; no auto-record; the European species table (island species behind a region setting, off).
+  - Step 0, the PC model, is done:
+    - `Tools/classify.py` has stages 1–3, plus the broadband (rub) rules;
+    - `Tools/species.py` has stages 4–6 and the European table;
+    - `Tools/bat_signals.py` makes the bench signals.
+    - `python -I Tools/classify.py --selftest` (13 bench signals) must pass after any change; `--doc-params` runs the original design's values, which are known to fail on noise (diary 43).
+    - The self-test copies the board's noise from `Captures/20261030_143507_raw_quiet-room.npz` (not in git). It was recorded on top of the user's PC: the ~20–25 kHz energy in it (and in the other bench captures) is PC interference that isn't there outdoors. Use it for bench checks only, never as evidence of field performance. Without it, it falls back to white noise ("Noise: white" on its first line) and fails one noctule f_char check (diary 50).
+  - Real recordings (diary 49): `python -I Tools/real_calls.py <Bat_recordings.zip> [--validate]` rebuilds the Zenodo 3247097 pipistrelle recordings (download it from zenodo.org; not in the repo) and scores the model.
+    - 96% of the dataset's calls found. Its "silent" stretches give ~820 detections a minute: mostly 10–20 kHz sounds (insects, recorder noise), about 1 in 8 faint pipistrelles (diary 50).
+    - Common pipistrelle named in 41% of recordings, with 1% wrong species; the rest fall back to a group or "Bat sp.".
+    - Soprano 10% right, 15% wrong (named common). The dataset's sopranos mostly sit at 50–52 kHz, not the textbook 53–58, so its labels are in doubt.
+    - A boundary fitted on half the nights didn't help on the other half.
+  - Labelled recordings (diary 50): `python -I Tools/labelled_calls.py Captures/Xeno_canto Captures/biodiversotyireland` scores 40 xeno-canto and Biodiversity Ireland files, 11 species, labelled in the file name. The files were downloaded by browser and aren't in git.
+    - Common (42.9–48.3 kHz) and soprano (54.4–58.5 kHz) separate cleanly on them: the textbook ranges hold.
+    - Verdicts: 12 right, 9 group, 10 "Bat sp.", 9 wrong.
+    - The main error is sound at 10–35 kHz that isn't echolocation (pipistrelle social calls, insects), winning the last-10-call vote.
+    - In a call, the peak is searched for only down to 16 kHz below its last point (`drop_max_khz`), so calls don't jump to other sounds: the lesser horseshoe is now named.
+  - Summary for deciding what's next: `Docs/CLASSIFIER_FINDINGS.md` (Nov 4): how it works, the results, the options.
+  - Steps 1 and 2, the classifier on the device, built Nov 4 (diary 51, `classifier.c` above). The C matches the model on 40 labelled recordings: all 17,519 calls within a frame, 59/59 sequence verdicts.
+  - Next, on the board:
+    - flash it; check the audio, waterfall and recording are unaffected;
+    - read `classifierBlockCyclesMax`;
+    - make a pass with the 40 kHz sensor and see a verdict;
+    - with `CALL_LOG_CALLS 1`, record the same, and run `check_classifier_c.py --device` on `CALLS.CSV` and the WAV.
+  - Then on the PC: keep social calls out of the vote, a pass verdict that can name two bats, the user's rub WAVs.
+  - The rules are literature values until they're refitted to passes recorded in spring.
 - WAV metadata for bat-ID software: the files are plain PCM WAV today. Next, a GUANO chunk in the header's 460-byte pad (no layout change). Timestamps need Y1.
 - Battery gauge accuracy: the reading is ratiometric to VDDA, which sags once the MCP1700 drops out near empty. That needs VREFINT, which is on ADC1, the audio ADC.
 - Gain range switching or AGC.

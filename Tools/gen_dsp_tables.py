@@ -2,8 +2,8 @@
 Generate the constant DSP lookup tables stored in flash.
 
 Writes Core/DSP/Tables/dsp_tables.c and dsp_tables.h. Run it from anywhere
-after changing AUDIO_FFT_LENGTH (Core/Inc/pipeline_config.h) or LUT_SIZE
-(Core/DSP/dsp.h):
+after changing AUDIO_FFT_LENGTH (Core/Inc/pipeline_config.h), LUT_SIZE
+(Core/DSP/dsp.h) or CLS_FFT_LENGTH (Core/DSP/classifier_config.h):
 
     python Tools/gen_dsp_tables.py
 
@@ -22,6 +22,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 PIPELINE_CONFIG = ROOT / "Core" / "Inc" / "pipeline_config.h"
 DSP_HEADER = ROOT / "Core" / "DSP" / "dsp.h"
+CLASSIFIER_CONFIG = ROOT / "Core" / "DSP" / "classifier_config.h"
 OUT_DIR = ROOT / "Core" / "DSP" / "Tables"
 
 
@@ -55,9 +56,8 @@ def c_array(ctype, name, size_expr, values, formatter, per_line):
     return "\n".join(lines)
 
 
-def main():
-    fft_length = read_define(PIPELINE_CONFIG, "AUDIO_FFT_LENGTH")
-    sine_length = read_define(DSP_HEADER, "LUT_SIZE")
+def fft_tables(fft_length):
+    """Hann window (symmetric), complex-FFT twiddles and real-FFT unpack rotation"""
     cfft_length = fft_length // 2
 
     # Hann window, symmetric: w[n] = 0.5 * (1 - cos(2*pi*n / (N-1)))
@@ -79,6 +79,27 @@ def main():
         angle = f32(2.0 * math.pi * k / fft_length)
         unpack_cos.append(f32(math.cos(angle)))
         unpack_sin.append(f32(math.sin(angle)))
+
+    return window, twiddle_re, twiddle_im, unpack_cos, unpack_sin
+
+
+def bit_reverse(count):
+    bits = count.bit_length() - 1
+    return [int(f"{i:0{bits}b}"[::-1], 2) for i in range(count)]
+
+
+def main():
+    fft_length = read_define(PIPELINE_CONFIG, "AUDIO_FFT_LENGTH")
+    cls_length = read_define(CLASSIFIER_CONFIG, "CLS_FFT_LENGTH")
+    sine_length = read_define(DSP_HEADER, "LUT_SIZE")
+    cfft_length = fft_length // 2
+
+    window, twiddle_re, twiddle_im, unpack_cos, unpack_sin = fft_tables(fft_length)
+
+    # The species classifier's small FFT (classifier_calls.c), and its bit-reversal order
+    cls_window, cls_twiddle_re, cls_twiddle_im, cls_unpack_cos, cls_unpack_sin = fft_tables(cls_length)
+    cls_cfft_length = cls_length // 2
+    cls_bitrev = bit_reverse(cls_cfft_length)
 
     # Heterodyne NCO: (int16_t)(32767 * sinf(2*pi*i/L)), truncated toward zero
     sine = []
@@ -102,6 +123,8 @@ def main():
 #define DSP_TABLES_FFT_LENGTH   {fft_length}U   /* real samples per FFT frame */
 #define DSP_TABLES_CFFT_LENGTH  {cfft_length}U    /* complex FFT length */
 #define DSP_TABLES_SINE_LENGTH  {sine_length}U    /* heterodyne NCO table entries */
+#define DSP_TABLES_CLS_FFT_LENGTH   {cls_length}U   /* the species classifier's FFT */
+#define DSP_TABLES_CLS_CFFT_LENGTH  {cls_cfft_length}U
 
 
 /* Hann window, one coefficient per real sample */
@@ -117,6 +140,15 @@ extern const float fftUnpackSin[DSP_TABLES_CFFT_LENGTH];
 
 /* One sine cycle for the heterodyne NCO, full scale 32767 */
 extern const int16_t dspSineTable[DSP_TABLES_SINE_LENGTH];
+
+/* The species classifier's FFT: the same four tables at its length, and the
+ * bit-reversed order of its complex FFT's indices */
+extern const float clsHannWindow[DSP_TABLES_CLS_FFT_LENGTH];
+extern const float clsTwiddleRe[DSP_TABLES_CLS_CFFT_LENGTH / 2U];
+extern const float clsTwiddleIm[DSP_TABLES_CLS_CFFT_LENGTH / 2U];
+extern const float clsUnpackCos[DSP_TABLES_CLS_CFFT_LENGTH];
+extern const float clsUnpackSin[DSP_TABLES_CLS_CFFT_LENGTH];
+extern const uint8_t clsBitReverse[DSP_TABLES_CLS_CFFT_LENGTH];
 
 
 #endif /* DSP_TABLES_H_ */
@@ -142,14 +174,28 @@ extern const int16_t dspSineTable[DSP_TABLES_SINE_LENGTH];
         + c_array("float", "fftUnpackSin", "DSP_TABLES_CFFT_LENGTH", unpack_sin, c_float, 4),
         "/* (int16_t)(32767 * sin(2*pi*i / SINE_LENGTH)) */\n"
         + c_array("int16_t", "dspSineTable", "DSP_TABLES_SINE_LENGTH", sine, str, 8),
+        "/* w[n] = 0.5 * (1 - cos(2*pi*n / (CLS_FFT_LENGTH - 1))) */\n"
+        + c_array("float", "clsHannWindow", "DSP_TABLES_CLS_FFT_LENGTH", cls_window, c_float, 4),
+        "/* cos(-2*pi*k / CLS_CFFT_LENGTH) */\n"
+        + c_array("float", "clsTwiddleRe", "DSP_TABLES_CLS_CFFT_LENGTH / 2U", cls_twiddle_re, c_float, 4),
+        "/* sin(-2*pi*k / CLS_CFFT_LENGTH) */\n"
+        + c_array("float", "clsTwiddleIm", "DSP_TABLES_CLS_CFFT_LENGTH / 2U", cls_twiddle_im, c_float, 4),
+        "/* cos(2*pi*k / CLS_FFT_LENGTH) */\n"
+        + c_array("float", "clsUnpackCos", "DSP_TABLES_CLS_CFFT_LENGTH", cls_unpack_cos, c_float, 4),
+        "/* sin(2*pi*k / CLS_FFT_LENGTH) */\n"
+        + c_array("float", "clsUnpackSin", "DSP_TABLES_CLS_CFFT_LENGTH", cls_unpack_sin, c_float, 4),
+        "/* index i of the complex FFT, its bits reversed */\n"
+        + c_array("uint8_t", "clsBitReverse", "DSP_TABLES_CLS_CFFT_LENGTH", cls_bitrev, str, 16),
     ]) + "\n"
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     (OUT_DIR / "dsp_tables.h").write_text(header, newline="\n")
     (OUT_DIR / "dsp_tables.c").write_text(source, newline="\n")
 
-    total = 4 * (len(window) + 2 * len(twiddle_re) + 2 * len(unpack_cos)) + 2 * len(sine)
-    print(f"FFT length {fft_length}, sine table {sine_length}: wrote {total} bytes of tables to {OUT_DIR}")
+    total = (4 * (len(window) + 2 * len(twiddle_re) + 2 * len(unpack_cos)) + 2 * len(sine)
+             + 4 * (len(cls_window) + 2 * len(cls_twiddle_re) + 2 * len(cls_unpack_cos)) + len(cls_bitrev))
+    print(f"FFT length {fft_length}, sine table {sine_length}, classifier FFT {cls_length}: "
+          f"wrote {total} bytes of tables to {OUT_DIR}")
 
 
 if __name__ == "__main__":
